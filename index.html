@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calcolo Pronostico Underdog</title>
+</head>
+<body>
+    <h1>Calcolo Pronostico Underdog</h1>
+    <form method="POST">
+        <label>Vittorie:</label>
+        <input type="number" name="vittorie" required><br>
+        <label>Pareggi:</label>
+        <input type="number" name="pareggi" required><br>
+        <label>Sconfitte:</label>
+        <input type="number" name="sconfitte" required><br>
+        <label>Media gol fatti:</label>
+        <input type="number" step="0.1" name="media_gol_fatti" required><br>
+        <label>Media gol subiti:</label>
+        <input type="number" step="0.1" name="media_gol_subiti" required><br>
+        <label>Posizione:</label>
+        <input type="number" name="posizione" required><br>
+        <label>Quote (1 - X - 2):</label>
+        <input type="number" step="0.01" name="quota_1" required>
+        <input type="number" step="0.01" name="quota_x" required>
+        <input type="number" step="0.01" name="quota_2" required><br>
+        <label>Dove gioca:</label>
+        <select name="casa_trasferta">
+            <option value="Casa">Casa</option>
+            <option value="Trasferta">Trasferta</option>
+        </select><br>
+        <button type="submit">Calcola</button>
+    </form>
+    <h2>Risultato:</h2>
+    <p>{{ risultato }}</p>
+    <h2>Validazione parametri:</h2>
+    <ul>
+        {% for param in validazione_parametri %}
+        <li>{{ param }}</li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
