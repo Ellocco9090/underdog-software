@@ -8,92 +8,47 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
 
 ROME = ZoneInfo('Europe/Rome')
 OUT_DIR = Path(__file__).resolve().parent
-UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
 MONTHS = {1:'gen',2:'feb',3:'mar',4:'apr',5:'mag',6:'giu',7:'lug',8:'ago',9:'set',10:'ott',11:'nov',12:'dic'}
 
-def get_text(url: str, timeout: int = 35) -> str:
-    r = requests.get(url, headers={
-        'User-Agent': UA,
-        'Accept-Language': 'it-IT,it;q=0.9,en;q=0.6',
-        'Cache-Control': 'no-cache',
-    }, timeout=timeout)
-    r.raise_for_status()
-    return r.text
-
-def fetch_source(day: str) -> tuple[str, str]:
-    stamp = int(time.time())
-    # Prima la pagina diretta: è la più veloce e contiene il palinsesto corrente.
-    # Jina resta solo come fallback.
-    urls = [
-        f'https://odd24.io/odds?_cb={stamp}',
-        f'https://www.odd24.io/odds?_cb={stamp}',
-        f'https://odd24.io/odds?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0&pageSize=1000&providers=ALL&_cb={stamp}',
-        f'https://r.jina.ai/http://odd24.io/odds?_cb={stamp}',
-    ]
-    last = None
-    for url in urls:
-        try:
-            text = get_text(url, timeout=18)
-            if 'Doppia Chance' in text and ('GG / NG' in text or 'GG/NG' in text) and '1X2' in text:
-                return text, url
-            last = RuntimeError('pagina senza mercati principali')
-        except Exception as exc:
-            last = exc
-    raise last or RuntimeError('nessuna sorgente disponibile')
-
 def clean(s: str) -> str:
-    return re.sub(r'\s+', ' ', s.replace('\xa0',' ')).strip()
+    return re.sub(r'\s+', ' ', str(s or '').replace('\xa0',' ')).strip()
 
-def day_ok(day_num: str | None, mon: str | None, day: str) -> bool:
-    if not day_num or not mon:
-        return True
-    _, mo, d = map(int, day.split('-'))
-    return int(day_num) == d and mon.lower()[:3] == MONTHS[mo]
-
-def parse_time(line: str, day: str) -> str | None:
-    value = clean(line.replace('**','')).lstrip('#').strip()
-    m = re.match(r'^(\d{1,2}:\d{2})(?:\s+(\d{1,2})\s+([A-Za-zÀ-ÿ]{3}))?\b', value, re.I)
+def parse_time_text(value: str, day: str) -> str | None:
+    m = re.search(r'\b(\d{1,2}:\d{2})(?:\s+(\d{1,2})\s+([A-Za-zÀ-ÿ]{3}))?', clean(value), re.I)
     if not m:
         return None
-    if not day_ok(m.group(2), m.group(3), day):
-        return None
+    if m.group(2) and m.group(3):
+        _, mo, d = map(int, day.split('-'))
+        if int(m.group(2)) != d or m.group(3).lower()[:3] != MONTHS[mo]:
+            return None
     return m.group(1)
 
 def kickoff_iso(day: str, hhmm: str) -> str:
-    y, m, d = map(int, day.split('-'))
-    hh, mm = map(int, hhmm.split(':'))
+    y,m,d = map(int, day.split('-'))
+    hh,mm = map(int, hhmm.split(':'))
     return datetime(y,m,d,hh,mm,tzinfo=ROME).isoformat()
 
-def split_region(line: str) -> tuple[str,str]:
-    value = clean(line).lstrip('#').strip()
-    if ' - ' in value:
-        a,b = value.split(' - ',1)
-        return a.strip() or '—', b.strip() or '—'
-    return '—', value or '—'
-
-def split_teams(line: str) -> tuple[str,str] | None:
-    value = clean(line.replace('**','')).lstrip('#').strip()
-    if ' - ' not in value:
+def first_odd(value):
+    txt = str(value or '').replace('▲',' ').replace('▼',' ')
+    if '%' in txt or '—' in txt:
         return None
-    a,b = value.split(' - ',1)
-    a,b = a.strip(), b.strip()
-    return (a,b) if a and b else None
-
-def odd(value):
-    value = clean(str(value)).replace('▲','').replace('▼','').replace(',','.')
-    value = re.sub(r'[^0-9.]','', value)
+    m = re.search(r'(?<!\d)(\d{1,3}(?:[.,]\d{1,3})?)(?!\d)', txt)
+    if not m:
+        return None
     try:
-        n = float(value)
+        n = float(m.group(1).replace(',','.'))
     except Exception:
         return None
-    return n if 1.0 < n < 20 else None
+    return n if 1.0 < n < 100 else None
 
 def add_record(out, base, market, outcome, value, confidence):
-    n = odd(value)
+    n = first_odd(value)
     if n is None:
         return
     out.append({
@@ -110,95 +65,20 @@ def add_record(out, base, market, outcome, value, confidence):
         '_serverFeed': True,
     })
 
-def parse_detail_blocks(text: str, day: str) -> list[dict]:
-    raw_lines = text.replace('\r','').split('\n')
-    out = []
-    i = 0
+def split_region(line: str):
+    value = clean(line)
+    if ' - ' in value:
+        country, league = value.split(' - ',1)
+        return country.strip() or '—', league.strip() or '—'
+    return '—', value or '—'
 
-    while i < len(raw_lines):
-        raw = raw_lines[i]
-        # IMPORTANT: ignora le righe della tabella. I blocchi dettaglio hanno il tempo da solo.
-        if '|' in raw:
-            i += 1
-            continue
-
-        hhmm = parse_time(raw, day)
-        if not hhmm:
-            i += 1
-            continue
-
-        j = i + 1
-        while j < len(raw_lines) and not clean(raw_lines[j]):
-            j += 1
-        if j >= len(raw_lines):
-            break
-        region_line = raw_lines[j]
-
-        k = j + 1
-        while k < len(raw_lines) and not clean(raw_lines[k]):
-            k += 1
-        if k >= len(raw_lines):
-            break
-
-        # la riga squadre nel mirror Jina inizia con ##
-        if not clean(raw_lines[k]).startswith('##'):
-            i += 1
-            continue
-
-        teams = split_teams(raw_lines[k])
-        if not teams:
-            i += 1
-            continue
-
-        country, league = split_region(region_line)
-        home, away = teams
-
-        z = k + 1
-        while z < len(raw_lines):
-            candidate = raw_lines[z]
-            if '|' not in candidate and parse_time(candidate, day):
-                break
-            z += 1
-
-        block = '\n'.join(clean(x.replace('**','')) for x in raw_lines[k+1:z] if clean(x))
-        base = {
-            'home': home,
-            'away': away,
-            'country': country,
-            'league': league,
-            'kickoff': kickoff_iso(day, hhmm),
-            'id': f'{day}|{hhmm}|{home}|{away}',
-        }
-
-        m = re.search(r'1X2\s+1\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?\sX\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?\s2\s+([0-9]+(?:[.,][0-9]+)?)\s+', block, re.I|re.S)
-        if m:
-            add_record(out,base,'1X2','1',m.group(1),.68)
-            add_record(out,base,'1X2','2',m.group(3),.68)
-
-        m = re.search(r'Doppia\s+Chance\s+1X\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?\s12\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?\sX2\s+([0-9]+(?:[.,][0-9]+)?)\s+', block, re.I|re.S)
-        if m:
-            add_record(out,base,'Doppia chance','1X',m.group(1),.78)
-            add_record(out,base,'Doppia chance','12',m.group(2),.74)
-            add_record(out,base,'Doppia chance','X2',m.group(3),.78)
-
-        m = re.search(r'Over/Under\s+2[.,]5\s+Over\s*\(2[.,]5\)\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?Under\s*\(2[.,]5\)\s+([0-9]+(?:[.,][0-9]+)?)\s+', block, re.I|re.S)
-        if m:
-            add_record(out,base,'Over/Under','Over 2.5',m.group(1),.72)
-            add_record(out,base,'Over/Under','Under 2.5',m.group(2),.72)
-
-        m = re.search(r'GG\s*/\s*NG\s+GG\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?\sNG\s+([0-9]+(?:[.,][0-9]+)?)\s+', block, re.I|re.S)
-        if m:
-            add_record(out,base,'Gol/No Gol','GG',m.group(1),.70)
-            add_record(out,base,'Gol/No Gol','NG',m.group(2),.70)
-
-        m = re.search(r'Over/Under\s+1[.,]5\s+Over\s*\(1[.,]5\)\s+([0-9]+(?:[.,][0-9]+)?)\s+.*?Under\s*\(1[.,]5\)\s+([0-9]+(?:[.,][0-9]+)?)\s+', block, re.I|re.S)
-        if m:
-            add_record(out,base,'Over/Under','Over 1.5',m.group(1),.78)
-            add_record(out,base,'Over/Under','Under 1.5',m.group(2),.66)
-
-        i = max(z, i+1)
-
-    return out
+def split_teams(line: str):
+    value = clean(line)
+    if ' - ' not in value:
+        return None
+    home, away = value.split(' - ',1)
+    home,away = home.strip(),away.strip()
+    return (home,away) if home and away else None
 
 LEAGUE_PREFIXES = sorted([
     'National First Division','National Football League','Mizoram Premier League',
@@ -214,77 +94,152 @@ LEAGUE_PREFIXES = sorted([
     'Eliteserien','Veikkausliiga','Ekstraklasa','COSAFA Cup U20','Cup'
 ], key=len, reverse=True)
 
-def split_event_cell(cell: str) -> tuple[str,str,str,str] | None:
-    value = clean(cell)
+def parse_event_cell(raw: str):
+    # La cella evento nel browser spesso mantiene:
+    # "Paese - Campionato\nCasa - Trasferta"
+    raw = str(raw or '').replace('\r','')
+    lines = [clean(x) for x in raw.split('\n') if clean(x)]
+    if len(lines) >= 2 and ' - ' in lines[0] and ' - ' in lines[-1]:
+        country, league = split_region(lines[0])
+        teams = split_teams(lines[-1])
+        if teams:
+            return country, league, teams[0], teams[1]
+
+    value = clean(raw)
     if ' - ' not in value:
         return None
     country, rest = value.split(' - ',1)
     if ' - ' not in rest:
         return None
+
     left, away = rest.rsplit(' - ',1)
-    country, left, away = country.strip(), left.strip(), away.strip()
+    country,left,away = country.strip(),left.strip(),away.strip()
 
     for prefix in LEAGUE_PREFIXES:
         if left.lower().startswith(prefix.lower() + ' '):
-            return country or '—', prefix, left[len(prefix):].strip(), away
+            home = left[len(prefix):].strip()
+            if home and away:
+                return country or '—', prefix, home, away
 
-    markers = [' Fc ',' Fk ',' Acs ',' Cs ',' Csm ',' Afc ',' Nk ',' Sc ',' Real ',' Dinamo ',' Dynamo ',' Al ',' El ']
-    cut = None
+    # Heuristica di emergenza: cerca l'inizio tipico del nome squadra.
+    markers = [' Fc ',' Fk ',' Acs ',' Cs ',' Csm ',' Afc ',' Nk ',' Sc ',' Real ',
+               ' Dinamo ',' Dynamo ',' Al ',' El ',' Atletico ',' Athletic ',' Union ']
+    padded = ' ' + left + ' '
+    best = None
     for marker in markers:
-        idx = (' '+left+' ').lower().find(marker.lower())
-        if idx > 0:
-            real_idx = max(0, idx-1)
-            if cut is None or real_idx < cut:
-                cut = real_idx
-    if cut is not None and cut > 0:
-        return country or '—', left[:cut].strip() or '—', left[cut:].strip(), away
+        idx = padded.lower().find(marker.lower())
+        if idx > 1 and (best is None or idx < best):
+            best = idx
+    if best is not None:
+        cut = max(0,best-1)
+        league = left[:cut].strip() or '—'
+        home = left[cut:].strip()
+        if home and away:
+            return country or '—', league, home, away
 
-    # Se non sappiamo separare bene campionato e squadra, non inventiamo il campionato.
     return country or '—', '—', left, away
 
-def parse_table(text: str, day: str) -> list[dict]:
-    out = []
-    for raw in text.replace('\r','').split('\n'):
-        line = clean(raw.replace('**',''))
-        if '|' not in line:
+def chrome_rows(day: str):
+    stamp = int(time.time())
+    url = (
+        'https://odd24.io/odds'
+        f'?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0'
+        f'&pageSize=1000&providers=ALL&_cb={stamp}'
+    )
+
+    opts = Options()
+    opts.add_argument('--headless=new')
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    opts.add_argument('--disable-gpu')
+    opts.add_argument('--window-size=1600,1200')
+    opts.add_argument('--lang=it-IT')
+    opts.add_argument('--disable-blink-features=AutomationControlled')
+    opts.set_capability('pageLoadStrategy','eager')
+
+    driver = webdriver.Chrome(options=opts)
+    try:
+        driver.set_page_load_timeout(45)
+        driver.get(url)
+
+        def enough_rows(d):
+            try:
+                return d.execute_script("""
+                    return [...document.querySelectorAll('tr')].filter(tr=>{
+                      const cells=[...tr.querySelectorAll('td')];
+                      return cells.length>=10 && /^\\s*\\d{1,2}:\\d{2}/.test(cells[0]?.innerText||'');
+                    }).length;
+                """) >= 5
+            except Exception:
+                return False
+
+        WebDriverWait(driver,45,poll_frequency=1).until(enough_rows)
+
+        rows = driver.execute_script("""
+            return [...document.querySelectorAll('tr')]
+              .map(tr=>[...tr.querySelectorAll('td')].map(td=>td.innerText||''))
+              .filter(cells=>cells.length>=10 && /^\\s*\\d{1,2}:\\d{2}/.test(cells[0]||''));
+        """)
+
+        return rows
+    finally:
+        driver.quit()
+
+def parse_rows(rows, day: str):
+    out=[]
+    debug=[]
+
+    for cells in rows:
+        if len(cells)<18:
+            if len(debug)<3:
+                debug.append(cells)
             continue
-        hhmm = parse_time(line.split('|',1)[0], day)
+
+        hhmm=parse_time_text(cells[0],day)
         if not hhmm:
             continue
 
-        cells = [clean(x) for x in line.split('|')]
-        while cells and not cells[0]:
-            cells.pop(0)
-        while cells and not cells[-1]:
-            cells.pop()
-        if len(cells) < 18:
-            continue
-
-        event = split_event_cell(cells[1])
+        event=parse_event_cell(cells[1])
         if not event:
+            if len(debug)<3:
+                debug.append(cells[:3])
             continue
-        country, league, home, away = event
 
-        base = {
-            'home':home,'away':away,'country':country,'league':league,
+        country,league,home,away=event
+        base={
+            'home':home,
+            'away':away,
+            'country':country,
+            'league':league,
             'kickoff':kickoff_iso(day,hhmm),
-            'id':f'{day}|{hhmm}|{home}|{away}'
+            'id':f'{day}|{hhmm}|{home}|{away}',
         }
 
-        # Layout ODD24 attuale:
-        # Ora|Evento|1|X|2|%|1X|12|X2|%|O2.5|U2.5|%|GG|NG|%|O1.5|U1.5|%...
-        add_record(out,base,'1X2','1',cells[2],.66)
-        add_record(out,base,'1X2','2',cells[4],.66)
-        add_record(out,base,'Doppia chance','1X',cells[6],.78)
-        add_record(out,base,'Doppia chance','12',cells[7],.74)
-        add_record(out,base,'Doppia chance','X2',cells[8],.78)
+        # Layout attuale:
+        # 0 Ora, 1 Evento,
+        # 2/3/4 = 1X2, 5 payout,
+        # 6/7/8 = DC, 9 payout,
+        # 10/11 = OU2.5, 12 payout,
+        # 13/14 = GG/NG, 15 payout,
+        # 16/17 = OU1.5, 18 payout.
+        add_record(out,base,'1X2','1',cells[2],.68)
+        add_record(out,base,'1X2','2',cells[4],.68)
+
+        add_record(out,base,'Doppia chance','1X',cells[6],.80)
+        add_record(out,base,'Doppia chance','12',cells[7],.76)
+        add_record(out,base,'Doppia chance','X2',cells[8],.80)
+
         add_record(out,base,'Over/Under','Over 2.5',cells[10],.72)
         add_record(out,base,'Over/Under','Under 2.5',cells[11],.72)
+
         add_record(out,base,'Gol/No Gol','GG',cells[13],.70)
         add_record(out,base,'Gol/No Gol','NG',cells[14],.70)
-        add_record(out,base,'Over/Under','Over 1.5',cells[16],.78)
+
+        add_record(out,base,'Over/Under','Over 1.5',cells[16],.80)
         add_record(out,base,'Over/Under','Under 1.5',cells[17],.66)
 
+    if debug:
+        print('DEBUG ROWS:',json.dumps(debug,ensure_ascii=False)[:4000],file=sys.stderr)
     return out
 
 def unique(records):
@@ -302,25 +257,20 @@ def counts(records):
     result={'1X2':0,'Doppia chance':0,'Over/Under':0,'Gol/No Gol':0}
     for r in records:
         if r['market_name'] in result:
-            result[r['market_name']] += 1
+            result[r['market_name']]+=1
     return result
 
 def main():
     now=datetime.now(ROME)
     day=now.strftime('%Y-%m-%d')
-    source_text, source_url=fetch_source(day)
 
-    # Prima prova i blocchi dettaglio (nomi campionato/squadre più precisi),
-    # poi completa con la tabella principale.
-    detail=parse_detail_blocks(source_text,day)
-    table=parse_table(source_text,day)
-    records=unique(detail+table)
+    rows=chrome_rows(day)
+    print(f'DOM rows: {len(rows)}')
 
+    records=unique(parse_rows(rows,day))
     c=counts(records)
-    complete=all(c[k]>0 for k in c)
-    if not complete or len(records)<20:
-        # salva un piccolo debug leggibile nel log
-        print(source_text[:7000], file=sys.stderr)
+
+    if len(records)<20 or not all(c[k]>0 for k in c):
         raise RuntimeError(f'feed incompleto: {len(records)} record, {c}')
 
     payload={
