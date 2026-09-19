@@ -26,16 +26,19 @@ def get_text(url: str, timeout: int = 35) -> str:
 
 def fetch_source(day: str) -> tuple[str, str]:
     stamp = int(time.time())
+    # Prima la pagina diretta: è la più veloce e contiene il palinsesto corrente.
+    # Jina resta solo come fallback.
     urls = [
-        f'https://r.jina.ai/http://odd24.io/odds?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0&pageSize=1000&providers=ALL&_cb={stamp}',
-        f'https://r.jina.ai/http://www.odd24.io/odds?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0&pageSize=1000&providers=ALL&_cb={stamp}',
+        f'https://odd24.io/odds?_cb={stamp}',
+        f'https://www.odd24.io/odds?_cb={stamp}',
+        f'https://odd24.io/odds?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0&pageSize=1000&providers=ALL&_cb={stamp}',
         f'https://r.jina.ai/http://odd24.io/odds?_cb={stamp}',
     ]
     last = None
     for url in urls:
         try:
-            text = get_text(url)
-            if 'Doppia Chance' in text and 'GG / NG' in text and '1X2' in text:
+            text = get_text(url, timeout=18)
+            if 'Doppia Chance' in text and ('GG / NG' in text or 'GG/NG' in text) and '1X2' in text:
                 return text, url
             last = RuntimeError('pagina senza mercati principali')
         except Exception as exc:
