@@ -4,7 +4,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -95,8 +95,6 @@ LEAGUE_PREFIXES = sorted([
 ], key=len, reverse=True)
 
 def parse_event_cell(raw: str):
-    # La cella evento nel browser spesso mantiene:
-    # "Paese - Campionato\nCasa - Trasferta"
     raw = str(raw or '').replace('\r','')
     lines = [clean(x) for x in raw.split('\n') if clean(x)]
     if len(lines) >= 2 and ' - ' in lines[0] and ' - ' in lines[-1]:
@@ -121,7 +119,6 @@ def parse_event_cell(raw: str):
             if home and away:
                 return country or '—', prefix, home, away
 
-    # Heuristica di emergenza: cerca l'inizio tipico del nome squadra.
     markers = [' Fc ',' Fk ',' Acs ',' Cs ',' Csm ',' Afc ',' Nk ',' Sc ',' Real ',
                ' Dinamo ',' Dynamo ',' Al ',' El ',' Atletico ',' Athletic ',' Union ']
     padded = ' ' + left + ' '
@@ -139,14 +136,7 @@ def parse_event_cell(raw: str):
 
     return country or '—', '—', left, away
 
-def chrome_rows(day: str):
-    stamp = int(time.time())
-    url = (
-        'https://odd24.io/odds'
-        f'?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0'
-        f'&pageSize=1000&providers=ALL&_cb={stamp}'
-    )
-
+def make_options():
     opts = Options()
     opts.add_argument('--headless=new')
     opts.add_argument('--no-sandbox')
@@ -156,43 +146,64 @@ def chrome_rows(day: str):
     opts.add_argument('--lang=it-IT')
     opts.add_argument('--disable-blink-features=AutomationControlled')
     opts.set_capability('pageLoadStrategy','eager')
+    return opts
 
-    driver = webdriver.Chrome(options=opts)
-    try:
-        driver.set_page_load_timeout(45)
-        driver.get(url)
+def chrome_rows(day: str, attempts: int = 3):
+    last_error = None
 
-        def enough_rows(d):
+    for attempt in range(1, attempts+1):
+        stamp = int(time.time())
+        url = (
+            'https://odd24.io/odds'
+            f'?dates={day}&days=1&markets=PRINCIPALI&minAgioPct=0'
+            f'&pageSize=1000&providers=ALL&_cb={stamp}-{attempt}'
+        )
+
+        driver = webdriver.Chrome(options=make_options())
+        try:
+            driver.set_page_load_timeout(35)
+            driver.get(url)
+
+            def count_rows(d):
+                try:
+                    return d.execute_script("""
+                        return [...document.querySelectorAll('tr')].filter(tr=>{
+                          const cells=[...tr.querySelectorAll('td')];
+                          return cells.length>=10 && /^\s*\d{1,2}:\d{2}/.test(cells[0]?.innerText||'');
+                        }).length;
+                    """)
+                except Exception:
+                    return 0
+
             try:
-                return d.execute_script("""
-                    return [...document.querySelectorAll('tr')].filter(tr=>{
-                      const cells=[...tr.querySelectorAll('td')];
-                      return cells.length>=10 && /^\\s*\\d{1,2}:\\d{2}/.test(cells[0]?.innerText||'');
-                    }).length;
-                """) >= 5
+                WebDriverWait(driver,30,poll_frequency=1).until(lambda d: count_rows(d) >= 5)
             except Exception:
-                return False
+                # Anche se il wait scade, prova a leggere ciò che la pagina ha già renderizzato.
+                pass
 
-        WebDriverWait(driver,45,poll_frequency=1).until(enough_rows)
+            rows = driver.execute_script("""
+                return [...document.querySelectorAll('tr')]
+                  .map(tr=>[...tr.querySelectorAll('td')].map(td=>td.innerText||''))
+                  .filter(cells=>cells.length>=10 && /^\s*\d{1,2}:\d{2}/.test(cells[0]||''));
+            """)
 
-        rows = driver.execute_script("""
-            return [...document.querySelectorAll('tr')]
-              .map(tr=>[...tr.querySelectorAll('td')].map(td=>td.innerText||''))
-              .filter(cells=>cells.length>=10 && /^\\s*\\d{1,2}:\\d{2}/.test(cells[0]||''));
-        """)
+            if len(rows) >= 5:
+                return rows
 
-        return rows
-    finally:
-        driver.quit()
+            last_error = RuntimeError(f'{day}: solo {len(rows)} righe al tentativo {attempt}')
+        except Exception as exc:
+            last_error = exc
+        finally:
+            driver.quit()
+
+        time.sleep(3)
+
+    raise last_error or RuntimeError(f'{day}: nessuna riga disponibile')
 
 def parse_rows(rows, day: str):
     out=[]
-    debug=[]
-
     for cells in rows:
         if len(cells)<18:
-            if len(debug)<3:
-                debug.append(cells)
             continue
 
         hhmm=parse_time_text(cells[0],day)
@@ -201,8 +212,6 @@ def parse_rows(rows, day: str):
 
         event=parse_event_cell(cells[1])
         if not event:
-            if len(debug)<3:
-                debug.append(cells[:3])
             continue
 
         country,league,home,away=event
@@ -215,13 +224,6 @@ def parse_rows(rows, day: str):
             'id':f'{day}|{hhmm}|{home}|{away}',
         }
 
-        # Layout attuale:
-        # 0 Ora, 1 Evento,
-        # 2/3/4 = 1X2, 5 payout,
-        # 6/7/8 = DC, 9 payout,
-        # 10/11 = OU2.5, 12 payout,
-        # 13/14 = GG/NG, 15 payout,
-        # 16/17 = OU1.5, 18 payout.
         add_record(out,base,'1X2','1',cells[2],.68)
         add_record(out,base,'1X2','2',cells[4],.68)
 
@@ -238,8 +240,6 @@ def parse_rows(rows, day: str):
         add_record(out,base,'Over/Under','Over 1.5',cells[16],.80)
         add_record(out,base,'Over/Under','Under 1.5',cells[17],.66)
 
-    if debug:
-        print('DEBUG ROWS:',json.dumps(debug,ensure_ascii=False)[:4000],file=sys.stderr)
     return out
 
 def unique(records):
@@ -260,19 +260,17 @@ def counts(records):
             result[r['market_name']]+=1
     return result
 
-def main():
-    now=datetime.now(ROME)
-    day=now.strftime('%Y-%m-%d')
-
+def build_day(day: str, make_latest: bool):
     rows=chrome_rows(day)
-    print(f'DOM rows: {len(rows)}')
+    print(f'DOM rows {day}: {len(rows)}')
 
     records=unique(parse_rows(rows,day))
     c=counts(records)
 
     if len(records)<20 or not all(c[k]>0 for k in c):
-        raise RuntimeError(f'feed incompleto: {len(records)} record, {c}')
+        raise RuntimeError(f'{day}: feed incompleto: {len(records)} record, {c}')
 
+    now=datetime.now(ROME)
     payload={
         'date':day,
         'updated_at':now.isoformat(),
@@ -284,9 +282,33 @@ def main():
 
     OUT_DIR.mkdir(parents=True,exist_ok=True)
     data=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-    (OUT_DIR/'latest.json').write_text(data,encoding='utf-8')
     (OUT_DIR/f'{day}.json').write_text(data,encoding='utf-8')
+    if make_latest:
+        (OUT_DIR/'latest.json').write_text(data,encoding='utf-8')
+
     print(f'OK {day}: {len(records)} records {c}')
+
+def main():
+    now=datetime.now(ROME)
+    today=now.date()
+    tomorrow=today+timedelta(days=1)
+
+    errors=[]
+    built=0
+
+    # Prepara sempre sia oggi sia domani.
+    # Così allo scoccare della mezzanotte il file del nuovo giorno esiste già.
+    for d, make_latest in ((today, True), (tomorrow, False)):
+        day=d.isoformat()
+        try:
+            build_day(day, make_latest)
+            built+=1
+        except Exception as exc:
+            errors.append(f'{day}: {exc}')
+            print(f'WARN {day}: {exc}',file=sys.stderr)
+
+    if built==0:
+        raise RuntimeError('nessun feed generato: ' + ' | '.join(errors))
 
 if __name__=='__main__':
     try:
