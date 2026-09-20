@@ -3,7 +3,7 @@ name: Step By Step Daily Feed
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '*/20 * * * *'
   push:
     paths:
       - 'step-by-step-data/update_feed.py'
@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests selenium
 
-      - name: Build current-day feed
+      - name: Build today and tomorrow feeds
         run: python step-by-step-data/update_feed.py
 
       - name: Commit feed
