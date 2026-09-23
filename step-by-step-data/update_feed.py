@@ -215,6 +215,14 @@ def parse_rows(rows, day: str):
             continue
 
         country,league,home,away=event
+
+        # Scarta eventi malformati: una squadra non può giocare contro se stessa.
+        # Questo evita che un errore di parsing venga usato dal motore di selezione.
+        norm_home=re.sub(r'[^a-z0-9]+','',home.lower())
+        norm_away=re.sub(r'[^a-z0-9]+','',away.lower())
+        if norm_home and norm_home==norm_away:
+            continue
+
         base={
             'home':home,
             'away':away,
