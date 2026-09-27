@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import sys
 import time
+import unicodedata
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import requests
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -135,6 +141,414 @@ def parse_event_cell(raw: str):
             return country or '—', league, home, away
 
     return country or '—', '—', left, away
+
+
+def ascii_norm(value: str) -> str:
+    value = unicodedata.normalize('NFKD', clean(value)).encode('ascii','ignore').decode('ascii').lower()
+    value = re.sub(r'\b(fc|cf|sc|ac|afc|calcio|football club|club de futbol|futbol club)\b', ' ', value)
+    return re.sub(r'[^a-z0-9]+', ' ', value).strip()
+
+COUNTRY_GROUPS = {
+    'italy': {'italy','italia'},
+    'england': {'england','inghilterra'},
+    'scotland': {'scotland','scozia'},
+    'germany': {'germany','germania'},
+    'spain': {'spain','spagna'},
+    'france': {'france','francia'},
+    'netherlands': {'netherlands','olanda','paesi bassi'},
+    'belgium': {'belgium','belgio'},
+    'portugal': {'portugal','portogallo'},
+    'turkey': {'turkey','turkiye','turchia'},
+    'greece': {'greece','grecia'},
+}
+
+def country_key(value: str) -> str:
+    n = ascii_norm(value)
+    for key, aliases in COUNTRY_GROUPS.items():
+        if n in aliases:
+            return key
+    return n
+
+def football_data_code(country: str, league: str) -> str | None:
+    c = country_key(country)
+    l = ascii_norm(league)
+
+    # Esclude coppe, giovanili, riserve e femminile: i CSV usati qui sono campionati senior.
+    if re.search(r'\b(cup|coppa|u17|u18|u19|u20|u21|u23|youth|reserve|women|femminile|friendly)\b', l):
+        return None
+
+    if c == 'italy':
+        if 'serie a' in l: return 'I1'
+        if 'serie b' in l: return 'I2'
+
+    if c == 'england':
+        if 'premier league' in l: return 'E0'
+        if 'championship' in l: return 'E1'
+        if 'league one' in l: return 'E2'
+        if 'league two' in l: return 'E3'
+        if 'national league' in l or 'conference' in l: return 'EC'
+
+    if c == 'scotland':
+        if 'premiership' in l: return 'SC0'
+        if 'championship' in l: return 'SC1'
+        if 'league one' in l: return 'SC2'
+        if 'league two' in l: return 'SC3'
+
+    if c == 'germany':
+        if '2 bundesliga' in l or '2nd bundesliga' in l: return 'D2'
+        if 'bundesliga' in l: return 'D1'
+
+    if c == 'spain':
+        if 'segunda' in l: return 'SP2'
+        if 'la liga' in l or 'primera division' in l: return 'SP1'
+
+    if c == 'france':
+        if 'ligue 2' in l: return 'F2'
+        if 'ligue 1' in l: return 'F1'
+
+    if c == 'netherlands' and 'eredivisie' in l:
+        return 'N1'
+
+    if c == 'belgium' and ('jupiler' in l or 'first division a' in l or 'pro league' in l):
+        return 'B1'
+
+    if c == 'portugal' and ('primeira liga' in l or 'liga portugal' in l):
+        return 'P1'
+
+    if c == 'turkey' and ('super lig' in l or 'super league' in l):
+        return 'T1'
+
+    if c == 'greece' and ('super league' in l or 'ethniki' in l):
+        return 'G1'
+
+    return None
+
+def season_codes_for(day: str):
+    y,m,_ = map(int, day.split('-'))
+    if m >= 7:
+        current_start = y
+    else:
+        current_start = y - 1
+    previous_start = current_start - 1
+
+    def code(start):
+        return f'{start%100:02d}{(start+1)%100:02d}'
+
+    return code(current_start), code(previous_start)
+
+def parse_csv_date(value: str):
+    txt = clean(value)
+    for fmt in ('%d/%m/%Y','%d/%m/%y','%d/%m/%Y %H:%M','%d/%m/%y %H:%M'):
+        try:
+            return datetime.strptime(txt, fmt).replace(tzinfo=ROME)
+        except Exception:
+            pass
+    return None
+
+def fetch_football_data_csv(season_code: str, division_code: str):
+    url = f'https://www.football-data.co.uk/mmz4281/{season_code}/{division_code}.csv'
+    response = requests.get(
+        url,
+        timeout=14,
+        headers={'User-Agent':'Mozilla/5.0 StepByStep/1.0'}
+    )
+    response.raise_for_status()
+
+    # Alcuni file storici possono usare BOM.
+    text = response.content.decode('utf-8-sig', errors='replace')
+    rows = list(csv.DictReader(io.StringIO(text)))
+    return rows
+
+def load_league_history(division_code: str, day: str):
+    current_code, previous_code = season_codes_for(day)
+    target_day = datetime.fromisoformat(day).replace(tzinfo=ROME)
+    rows = []
+    current_rows = []
+
+    for season_code, is_current in ((previous_code,False),(current_code,True)):
+        try:
+            season_rows = fetch_football_data_csv(season_code, division_code)
+        except Exception as exc:
+            print(f'WARN stats {division_code} {season_code}: {exc}', file=sys.stderr)
+            continue
+
+        for raw in season_rows:
+            dt = parse_csv_date(raw.get('Date',''))
+            if not dt or dt.date() >= target_day.date():
+                continue
+
+            try:
+                hg = int(float(raw.get('FTHG','')))
+                ag = int(float(raw.get('FTAG','')))
+            except Exception:
+                continue
+
+            item = {
+                'date': dt,
+                'home': clean(raw.get('HomeTeam','')),
+                'away': clean(raw.get('AwayTeam','')),
+                'hg': hg,
+                'ag': ag,
+                'hs': raw.get('HS',''),
+                'as': raw.get('AS',''),
+                'hst': raw.get('HST',''),
+                'ast': raw.get('AST',''),
+                'current': is_current,
+            }
+
+            if item['home'] and item['away']:
+                rows.append(item)
+                if is_current:
+                    current_rows.append(item)
+
+    rows.sort(key=lambda x: x['date'])
+    current_rows.sort(key=lambda x: x['date'])
+
+    teams = sorted({r['home'] for r in rows} | {r['away'] for r in rows})
+    return {'rows':rows,'current_rows':current_rows,'teams':teams}
+
+def match_team_name(feed_name: str, candidates):
+    target = ascii_norm(feed_name)
+    if not target:
+        return None
+
+    exact = {ascii_norm(name):name for name in candidates}
+    if target in exact:
+        return exact[target]
+
+    best_name = None
+    best_score = 0.0
+
+    for name in candidates:
+        n = ascii_norm(name)
+        if not n:
+            continue
+
+        compact_t = target.replace(' ','')
+        compact_n = n.replace(' ','')
+
+        if len(compact_t) >= 5 and (compact_t in compact_n or compact_n in compact_t):
+            score = 0.90
+        else:
+            score = SequenceMatcher(None, compact_t, compact_n).ratio()
+
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    return best_name if best_score >= 0.72 else None
+
+def num_or_none(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def team_matches(history_rows, team):
+    return [r for r in history_rows if r['home'] == team or r['away'] == team]
+
+def team_metrics(matches, team, limit=10, venue=None):
+    selected = []
+
+    for r in matches:
+        is_home = r['home'] == team
+        if venue == 'home' and not is_home:
+            continue
+        if venue == 'away' and is_home:
+            continue
+        selected.append(r)
+
+    selected = selected[-limit:]
+    n = len(selected)
+
+    if not n:
+        return {'matches':0}
+
+    wins=draws=losses=gf=ga=over15=over25=btts=scored=clean_sheets=points=0
+    shots=shots_on_target=0.0
+    shots_n=sot_n=0
+
+    for r in selected:
+        is_home = r['home'] == team
+        tgf = r['hg'] if is_home else r['ag']
+        tga = r['ag'] if is_home else r['hg']
+
+        gf += tgf
+        ga += tga
+
+        if tgf > tga:
+            wins += 1
+            points += 3
+        elif tgf == tga:
+            draws += 1
+            points += 1
+        else:
+            losses += 1
+
+        total = tgf + tga
+        over15 += int(total >= 2)
+        over25 += int(total >= 3)
+        btts += int(tgf > 0 and tga > 0)
+        scored += int(tgf > 0)
+        clean_sheets += int(tga == 0)
+
+        sh = num_or_none(r['hs'] if is_home else r['as'])
+        st = num_or_none(r['hst'] if is_home else r['ast'])
+
+        if sh is not None:
+            shots += sh
+            shots_n += 1
+        if st is not None:
+            shots_on_target += st
+            sot_n += 1
+
+    return {
+        'matches': n,
+        'wins': wins,
+        'draws': draws,
+        'losses': losses,
+        'ppg': round(points/n,3),
+        'gf_pg': round(gf/n,3),
+        'ga_pg': round(ga/n,3),
+        'goal_total_pg': round((gf+ga)/n,3),
+        'over15_rate': round(over15/n,3),
+        'over25_rate': round(over25/n,3),
+        'btts_rate': round(btts/n,3),
+        'scored_rate': round(scored/n,3),
+        'clean_sheet_rate': round(clean_sheets/n,3),
+        'shots_pg': round(shots/shots_n,2) if shots_n else None,
+        'sot_pg': round(shots_on_target/sot_n,2) if sot_n else None,
+    }
+
+def table_snapshot(current_rows):
+    table = {}
+
+    for r in current_rows:
+        for team in (r['home'],r['away']):
+            table.setdefault(team,{'played':0,'points':0,'gf':0,'ga':0})
+
+        h=table[r['home']]
+        a=table[r['away']]
+        h['played'] += 1
+        a['played'] += 1
+        h['gf'] += r['hg']; h['ga'] += r['ag']
+        a['gf'] += r['ag']; a['ga'] += r['hg']
+
+        if r['hg'] > r['ag']:
+            h['points'] += 3
+        elif r['hg'] < r['ag']:
+            a['points'] += 3
+        else:
+            h['points'] += 1
+            a['points'] += 1
+
+    ordered = sorted(
+        table.items(),
+        key=lambda kv:(kv[1]['points'],kv[1]['gf']-kv[1]['ga'],kv[1]['gf']),
+        reverse=True
+    )
+
+    out={}
+    total=len(ordered)
+
+    for pos,(team,row) in enumerate(ordered,1):
+        played=row['played']
+        out[team]={
+            'position':pos,
+            'teams':total,
+            'played':played,
+            'points':row['points'],
+            'ppg':round(row['points']/played,3) if played else 0,
+            'goal_diff':row['gf']-row['ga'],
+        }
+
+    return out
+
+def workload_metrics(rows, team, day):
+    target = datetime.fromisoformat(day).replace(tzinfo=ROME)
+    dates=[r['date'] for r in rows if r['home']==team or r['away']==team]
+    dates=[d for d in dates if d < target]
+
+    if not dates:
+        return {'rest_days':None,'matches_14d':0}
+
+    last=max(dates)
+    rest=(target.date()-last.date()).days
+    matches_14=sum(1 for d in dates if 0 < (target.date()-d.date()).days <= 14)
+
+    return {'rest_days':rest,'matches_14d':matches_14}
+
+def fixture_stat_profile(history, home_name, away_name, day):
+    rows=history['rows']
+    current_rows=history['current_rows']
+    table=table_snapshot(current_rows)
+
+    home_all=team_metrics(rows,home_name,10,None)
+    away_all=team_metrics(rows,away_name,10,None)
+    home_venue=team_metrics(rows,home_name,5,'home')
+    away_venue=team_metrics(rows,away_name,5,'away')
+
+    return {
+        'coverage':'historical-results',
+        'home':home_all,
+        'away':away_all,
+        'home_venue':home_venue,
+        'away_venue':away_venue,
+        'home_table':table.get(home_name),
+        'away_table':table.get(away_name),
+        'home_workload':workload_metrics(rows,home_name,day),
+        'away_workload':workload_metrics(rows,away_name,day),
+    }
+
+def enrich_records_with_stats(records, day: str):
+    by_event={}
+    for r in records:
+        by_event.setdefault(r['event_id'],r)
+
+    needed_codes={}
+    for event_id,r in by_event.items():
+        code=football_data_code(r.get('country',''),r.get('league_name',''))
+        if code:
+            needed_codes.setdefault(code,[]).append(event_id)
+
+    histories={}
+    for code in needed_codes:
+        try:
+            histories[code]=load_league_history(code,day)
+        except Exception as exc:
+            print(f'WARN stats league {code}: {exc}',file=sys.stderr)
+
+    profiles={}
+    for event_id,r in by_event.items():
+        code=football_data_code(r.get('country',''),r.get('league_name',''))
+        history=histories.get(code)
+        if not history or not history['teams']:
+            continue
+
+        home=match_team_name(r.get('home_team',''),history['teams'])
+        away=match_team_name(r.get('away_team',''),history['teams'])
+
+        if not home or not away or home==away:
+            continue
+
+        profile=fixture_stat_profile(history,home,away,day)
+
+        # Richiediamo almeno un minimo di storico reale per considerare
+        # la conferma statistica utilizzabile.
+        if profile['home'].get('matches',0) < 3 or profile['away'].get('matches',0) < 3:
+            continue
+
+        profiles[event_id]=profile
+
+    enriched=0
+    for r in records:
+        profile=profiles.get(r['event_id'])
+        if profile:
+            r['_stats']=profile
+            enriched+=1
+
+    return records, len(profiles), enriched
+
 
 def make_options():
     opts = Options()
@@ -273,6 +687,7 @@ def build_day(day: str, make_latest: bool):
     print(f'DOM rows {day}: {len(rows)}')
 
     records=unique(parse_rows(rows,day))
+    records,stat_fixtures,stat_records=enrich_records_with_stats(records,day)
     c=counts(records)
 
     if len(records)<20 or not all(c[k]>0 for k in c):
@@ -285,6 +700,7 @@ def build_day(day: str, make_latest: bool):
         'timezone':'Europe/Rome',
         'source_ok':True,
         'counts':c,
+        'stats_coverage':{'fixtures':stat_fixtures,'records':stat_records},
         'records':records,
     }
 
@@ -294,7 +710,7 @@ def build_day(day: str, make_latest: bool):
     if make_latest:
         (OUT_DIR/'latest.json').write_text(data,encoding='utf-8')
 
-    print(f'OK {day}: {len(records)} records {c}')
+    print(f'OK {day}: {len(records)} records {c} | stats fixtures={stat_fixtures} records={stat_records}')
 
 def main():
     now=datetime.now(ROME)
