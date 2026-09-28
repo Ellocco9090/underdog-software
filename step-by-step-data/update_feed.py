@@ -162,6 +162,47 @@ COUNTRY_GROUPS = {
     'greece': {'greece','grecia'},
 }
 
+REGION_SUFFIXES = {
+    'rj','sp','mg','rs','sc','pr','ba','pe','ce','go','df','pb','rn','al','se','ma','pa','pi','mt','ms','es'
+}
+
+def canonical_team_key(value: str) -> str:
+    n = ascii_norm(value)
+    parts = n.split()
+    if parts and parts[-1] in REGION_SUFFIXES:
+        parts = parts[:-1]
+    return ' '.join(parts)
+
+def team_similarity(a: str, b: str) -> float:
+    x = canonical_team_key(a)
+    y = canonical_team_key(b)
+    if not x or not y:
+        return 0.0
+    if x == y:
+        return 1.0
+    if x in y or y in x:
+        return min(len(x),len(y))/max(len(x),len(y)) + 0.15
+    return SequenceMatcher(None,x,y).ratio()
+
+def same_fixture_record(a: dict, b: dict) -> bool:
+    try:
+        ta = datetime.fromisoformat(str(a.get('event_time','')))
+        tb = datetime.fromisoformat(str(b.get('event_time','')))
+        if abs((ta-tb).total_seconds()) > 20*60:
+            return False
+    except Exception:
+        return False
+
+    direct = (
+        team_similarity(a.get('home_team',''),b.get('home_team','')) >= .68 and
+        team_similarity(a.get('away_team',''),b.get('away_team','')) >= .68
+    )
+    swapped = (
+        team_similarity(a.get('home_team',''),b.get('away_team','')) >= .82 and
+        team_similarity(a.get('away_team',''),b.get('home_team','')) >= .82
+    )
+    return direct or swapped
+
 def country_key(value: str) -> str:
     n = ascii_norm(value)
     for key, aliases in COUNTRY_GROUPS.items():
@@ -682,6 +723,156 @@ def counts(records):
             result[r['market_name']]+=1
     return result
 
+def load_existing_board(day: str):
+    path = OUT_DIR / f'{day}.json'
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        board = payload.get('board')
+        roads = board.get('roads') if isinstance(board,dict) else None
+        if isinstance(roads,list) and len(roads) == 5 and all(len(r.get('selections',[])) == 2 for r in roads):
+            return board
+    except Exception:
+        return None
+    return None
+
+def board_market_bonus(record: dict) -> float:
+    market = record.get('market_name','')
+    outcome = record.get('selection_column','')
+    if market == 'Doppia chance': return 11.0
+    if market == 'Over/Under' and outcome == 'Over 1.5': return 10.0
+    if market == '1X2': return 6.0
+    if market == 'Over/Under': return 4.0
+    if market == 'Gol/No Gol': return 3.0
+    return 0.0
+
+def board_record_score(record: dict) -> float:
+    odd = float(record.get('odd') or 0)
+    conf = float(record.get('_marketConfidence') or .5)
+    if odd <= 1:
+        return -999
+    return conf*55 + (1/odd)*35 + board_market_bonus(record) - max(0,odd-1.35)*12
+
+def build_canonical_board(records, day: str, now: datetime):
+    # La board è costruita UNA SOLA VOLTA e poi conservata nei run successivi.
+    # Tutti i dispositivi scaricano quindi esattamente le stesse 5 strade.
+    future=[]
+    cutoff = now + timedelta(minutes=30)
+
+    for r in records:
+        try:
+            kickoff = datetime.fromisoformat(str(r.get('event_time','')))
+            odd = float(r.get('odd') or 0)
+        except Exception:
+            continue
+        if kickoff < cutoff:
+            continue
+        if odd < 1.05 or odd > 1.52:
+            continue
+        if r.get('selection_column') in ('X','Under 1.5'):
+            continue
+        future.append(r)
+
+    future.sort(key=lambda r:(
+        str(r.get('event_time','')),
+        canonical_team_key(r.get('home_team','')),
+        canonical_team_key(r.get('away_team','')),
+        str(r.get('market_name','')),
+        str(r.get('selection_column','')),
+        float(r.get('odd') or 0)
+    ))
+
+    groups=[]
+    for r in future:
+        found=None
+        for g in groups:
+            if same_fixture_record(g['rep'],r):
+                found=g
+                break
+        if found is None:
+            found={'rep':r,'records':[],'gid':len(groups)}
+            groups.append(found)
+        found['records'].append(r)
+
+    pool=[]
+    for g in groups:
+        ranked=sorted(
+            g['records'],
+            key=lambda r:(-board_record_score(r),float(r.get('odd') or 99),str(r.get('selection_column','')))
+        )[:3]
+        for r in ranked:
+            pool.append({'record':r,'score':board_record_score(r),'gid':g['gid']})
+
+    pool.sort(key=lambda x:(-x['score'],x['gid'],str(x['record'].get('market_name','')),str(x['record'].get('selection_column',''))))
+
+    pairs=[]
+    for i,a in enumerate(pool):
+        for b in pool[i+1:]:
+            if a['gid'] == b['gid']:
+                continue
+            total = float(a['record']['odd']) * float(b['record']['odd'])
+            if total < 1.50 or total > 1.60:
+                continue
+            same_league=(
+                a['record'].get('country') == b['record'].get('country') and
+                a['record'].get('league_name') == b['record'].get('league_name')
+            )
+            score=a['score']+b['score']-abs(total-1.50)*45-(1.2 if same_league else 0)
+            pairs.append({'a':a,'b':b,'total':total,'score':score})
+
+    pairs.sort(key=lambda p:(
+        -p['score'],
+        abs(p['total']-1.50),
+        p['a']['gid'],p['b']['gid']
+    ))
+
+    chosen=[]
+    used=set()
+    for p in pairs:
+        if p['a']['gid'] in used or p['b']['gid'] in used:
+            continue
+        chosen.append(p)
+        used.add(p['a']['gid'])
+        used.add(p['b']['gid'])
+        if len(chosen) == 5:
+            break
+
+    if len(chosen) < 5:
+        return None
+
+    roads=[]
+    for road,p in enumerate(chosen,1):
+        selections=[]
+        for item in (p['a'],p['b']):
+            r=item['record']
+            selections.append({
+                'home_team':r.get('home_team'),
+                'away_team':r.get('away_team'),
+                'event_time':r.get('event_time'),
+                'event_id':r.get('event_id'),
+                'league_name':r.get('league_name'),
+                'country':r.get('country'),
+                'market_name':r.get('market_name'),
+                'selection_column':r.get('selection_column'),
+                'odd':r.get('odd'),
+                '_marketConfidence':r.get('_marketConfidence'),
+                '_serverFeed':True,
+            })
+        roads.append({
+            'road':road,
+            'total_odds':round(p['total'],2),
+            'selections':selections,
+        })
+
+    return {
+        'version':1,
+        'date':day,
+        'generated_at':now.isoformat(),
+        'locked':True,
+        'roads':roads,
+    }
+
 def build_day(day: str, make_latest: bool):
     rows=chrome_rows(day)
     print(f'DOM rows {day}: {len(rows)}')
@@ -694,6 +885,10 @@ def build_day(day: str, make_latest: bool):
         raise RuntimeError(f'{day}: feed incompleto: {len(records)} record, {c}')
 
     now=datetime.now(ROME)
+    board=None
+    if make_latest:
+        board=load_existing_board(day) or build_canonical_board(records,day,now)
+
     payload={
         'date':day,
         'updated_at':now.isoformat(),
@@ -701,6 +896,7 @@ def build_day(day: str, make_latest: bool):
         'source_ok':True,
         'counts':c,
         'stats_coverage':{'fixtures':stat_fixtures,'records':stat_records},
+        'board':board,
         'records':records,
     }
 
