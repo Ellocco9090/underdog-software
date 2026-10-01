@@ -1430,7 +1430,89 @@ def matris_dc_values_from_html(html_text: str):
 
     return values
 
-def load_matris_high_confidence_dc_v9(records):
+def matris_team_match_in_text(team: str, page_text: str):
+    text=source_plain(page_text)
+    aliases=source_team_aliases(team)
+
+    # 1) Match esatto sugli alias normalizzati.
+    best_pos=None
+    for alias in aliases:
+        pos=text.find(alias)
+        if pos>=0 and (best_pos is None or pos<best_pos):
+            best_pos=pos
+    if best_pos is not None:
+        return 1.0,best_pos
+
+    # 2) Fuzzy match su finestre di parole. Serve per translitterazioni,
+    # suffissi FC/RJ/SP e varianti abbreviate tra feed e fonte.
+    target=source_plain(team)
+    target=re.sub(
+        r'\b(football club|futbol club|soccer club|club de futbol|fc|cf|sc|ac|afc)\b',
+        ' ',
+        target
+    )
+    target=re.sub(r'\s+',' ',target).strip()
+    if len(target)<5:
+        return 0.0,None
+
+    words=text.split()[:450]
+    twords=target.split()
+    widths=sorted(set([
+        max(1,len(twords)-1),
+        len(twords),
+        len(twords)+1,
+    ]))
+
+    best_score=0.0
+    best_word_pos=None
+    compact_target=target.replace(' ','')
+
+    for width in widths:
+        if width<=0 or width>len(words):
+            continue
+        for i in range(0,len(words)-width+1):
+            window=' '.join(words[i:i+width])
+            compact_window=window.replace(' ','')
+            if abs(len(compact_window)-len(compact_target))>max(5,int(len(compact_target)*.45)):
+                continue
+            score=SequenceMatcher(
+                None,
+                compact_target,
+                compact_window
+            ).ratio()
+            if score>best_score:
+                best_score=score
+                best_word_pos=i
+
+    if best_score>=.80:
+        return best_score,best_word_pos
+    return best_score,None
+
+def matris_page_payload_v12(html_text: str):
+    soup=BeautifulSoup(html_text,'html.parser')
+
+    # Il testo iniziale contiene normalmente squadre, data e previsione.
+    pieces=[]
+    if soup.title:
+        pieces.append(soup.title.get_text(' ',strip=True))
+    for node in soup.select('h1,h2,h3,main'):
+        txt=clean(node.get_text(' ',strip=True))
+        if txt:
+            pieces.append(txt[:1800])
+        if len(' '.join(pieces))>4500:
+            break
+
+    if not pieces:
+        pieces=[clean(soup.get_text(' ',strip=True))[:4500]]
+
+    page_text=' '.join(pieces)
+    dc=matris_dc_values_from_html(html_text)
+    return {
+        'text':source_plain(page_text),
+        'dc':dc,
+    }
+
+def load_matris_high_confidence_dc_v12(records, day: str):
     candidates=[
         r for r in records
         if r.get('market_name')=='Doppia chance' and
@@ -1446,123 +1528,127 @@ def load_matris_high_confidence_dc_v9(records):
     session=requests.Session()
     session.headers.update(headers)
 
-    # Matris usa ?gun= per cambiare giornata nella schermata fixtures.
-    # Leggiamo una finestra ampia attorno ad oggi e poi abbiniamo per squadre,
-    # così non dipendiamo dalla giornata selezionata di default sul sito.
+    # Le view ?gun= coprono il calendario vicino alla giornata corrente.
     seeds=[
         'https://matrisx.com/en',
-        *[f'https://matrisx.com/en?gun={offset}' for offset in range(-2,8)],
+        *[f'https://matrisx.com/en?gun={offset}' for offset in range(-3,10)],
     ]
 
-    league_urls=set()
-    match_index=[]
-
+    unique_links={}
     for seed in seeds:
         try:
-            response=session.get(seed,timeout=16)
+            response=session.get(seed,timeout=15)
             response.raise_for_status()
             soup=BeautifulSoup(response.text,'html.parser')
-            for a in soup.select('a[href]'):
-                href=str(a.get('href') or '')
-                if '/en/leagues/' in href or '/en/league/' in href:
-                    league_urls.add(absolute_url(seed,href))
-                if '/en/match/' in href:
-                    label=clean(
-                        a.get_text(' ',strip=True) or
-                        (a.parent.get_text(' ',strip=True) if a.parent else '')
-                    )
-                    match_index.append((absolute_url(seed,href),label))
+            for a in soup.select('a[href*="/en/match/"]'):
+                href=absolute_url(seed,str(a.get('href') or ''))
+                if not href:
+                    continue
+
+                node=a
+                for _ in range(3):
+                    if getattr(node,'parent',None) is not None:
+                        node=node.parent
+
+                context=clean(
+                    node.get_text(' ',strip=True)
+                    if node else
+                    a.get_text(' ',strip=True)
+                )
+                if len(context)>len(unique_links.get(href,'')):
+                    unique_links[href]=context[:900]
         except Exception as exc:
             print(f'WARN Matris seed {seed}: {exc}',file=sys.stderr)
 
-    def fetch_league(url):
-        response=session.get(url,timeout=16)
-        response.raise_for_status()
-        soup=BeautifulSoup(response.text,'html.parser')
-        rows=[]
-        for a in soup.select('a[href]'):
-            href=str(a.get('href') or '')
-            if '/en/match/' not in href:
-                continue
-            parent_text=(
-                a.parent.get_text(' ',strip=True)
-                if a.parent else ''
-            )
-            label=clean(a.get_text(' ',strip=True)+' '+parent_text)
-            rows.append((absolute_url(url,href),label))
-        return rows
-
-    league_urls=list(league_urls)[:40]
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        jobs={pool.submit(fetch_league,url):url for url in league_urls}
-        for future in as_completed(jobs):
-            try:
-                match_index.extend(future.result())
-            except Exception as exc:
-                print(
-                    f'WARN Matris league {jobs[future]}: {exc}',
-                    file=sys.stderr
-                )
-
-    # URL unici mantenendo il testo più ricco.
-    unique_links={}
-    for url,label in match_index:
-        if not url:
-            continue
-        if len(label)>len(unique_links.get(url,'')):
-            unique_links[url]=label
-
-    print(
-        f'MATRIS DISCOVERY: leagues={len(league_urls)} links={len(unique_links)} '
-        f'candidates={len(candidates)}'
-    )
-    event_to_url={}
-    for r in candidates:
-        for url,label in unique_links.items():
-            if (
-                aliases_present_in_text(r.get('home_team',''),label) and
-                aliases_present_in_text(r.get('away_team',''),label)
-            ):
-                event_to_url[r['event_id']]=url
-                break
-
-    urls=sorted(set(event_to_url.values()))
-    page_values={}
+    urls=sorted(unique_links.keys())[:140]
+    pages={}
 
     def fetch_match(url):
         response=session.get(url,timeout=16)
         response.raise_for_status()
-        return url,matris_dc_values_from_html(response.text)
+        return url,matris_page_payload_v12(response.text)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         jobs={pool.submit(fetch_match,url):url for url in urls}
         for future in as_completed(jobs):
             url=jobs[future]
             try:
-                key,values=future.result()
-                page_values[key]=values
+                key,payload=future.result()
+                if payload.get('dc'):
+                    pages[key]=payload
             except Exception as exc:
                 print(f'WARN Matris match {url}: {exc}',file=sys.stderr)
 
+    print(
+        f'MATRIS V12 {day}: links={len(unique_links)} '
+        f'pagine_con_DC={len(pages)} candidates={len(candidates)}'
+    )
+
+    # Abbina ogni fixture del feed alla pagina Matris usando entrambi i nomi.
+    matched={}
+    for r in candidates:
+        best=None
+        for url,payload in pages.items():
+            text=payload.get('text') or ''
+            hs,hp=matris_team_match_in_text(r.get('home_team',''),text)
+            as_,ap=matris_team_match_in_text(r.get('away_team',''),text)
+
+            if hp is None or ap is None:
+                continue
+            if hs<.80 or as_<.80:
+                continue
+
+            score=(hs+as_)/2
+            # Preferisce match con le due squadre vicine nel testo.
+            try:
+                distance=abs(int(hp)-int(ap))
+            except Exception:
+                distance=999
+            score-=min(distance,120)*.0007
+
+            if best is None or score>best[0]:
+                best=(score,url,hp,ap)
+
+        if best is not None and best[0]>=.78:
+            matched[r['event_id']]=best
+
     support={}
     for r in candidates:
-        url=event_to_url.get(r['event_id'])
-        if not url:
+        match=matched.get(r['event_id'])
+        if not match:
             continue
+
+        _,url,hp,ap=match
+        values=(pages.get(url) or {}).get('dc') or {}
         sign=str(r.get('selection_column') or '')
-        pct=float((page_values.get(url) or {}).get(sign) or 0)
-        if pct>=85.0:
-            support[(r['event_id'],r['market_name'],sign)]={
-                'source':'matris_dc_85',
-                'probability':round(pct,1),
-                'historical_win_rate':90.7,
-                'sample':7108,
-            }
+
+        # Se la pagina Matris presenta le squadre nell'ordine inverso,
+        # converte 1X <-> X2. Il 12 resta invariato.
+        page_sign=sign
+        if hp is not None and ap is not None and hp>ap:
+            if sign=='1X':
+                page_sign='X2'
+            elif sign=='X2':
+                page_sign='1X'
+
+        pct=float(values.get(page_sign) or 0)
+        if pct<85.0:
+            continue
+
+        support[(r['event_id'],r['market_name'],sign)]={
+            'source':'matris_dc_85',
+            'probability':round(pct,1),
+            # Track record pubblico della fascia >=85% DC.
+            'historical_win_rate':90.7,
+            'sample':7108,
+        }
 
     print(
-        f'VALIDATED90 Matris: {len(support)} selezioni DC>=85%'
+        f'VALIDATED90 Matris V12: matched={len(matched)} '
+        f'approved={len(support)} DC>=85%'
     )
     return support
+
 
 def load_footballprediction_ai_over15_v9(records):
     candidates=[
@@ -1793,7 +1879,7 @@ def load_ganhar_dc90_v11(records, day: str):
 def enrich_records_with_validated90_v9(records, day: str):
     # Fonti con track record pubblico >=90% nella fascia/mercato usato.
     # Le altre fonti restano controlli secondari/tie-breaker.
-    matris=load_matris_high_confidence_dc_v9(records)
+    matris=load_matris_high_confidence_dc_v12(records,day)
     fpai=load_footballprediction_ai_over15_v9(records)
     ganhar=load_ganhar_dc90_v11(records,day)
 
@@ -2116,38 +2202,6 @@ def enrich_records_with_multi_source_v6(records, pages):
 
     return records
 
-
-def matris_fixture_index_v8():
-    try:
-        response=requests.get(
-            'https://matrisx.com/en',
-            timeout=20,
-            headers={'User-Agent':'Mozilla/5.0 StepByStep/1.0','Accept':'text/html,*/*'}
-        )
-        response.raise_for_status()
-        soup=BeautifulSoup(response.text,'html.parser')
-        items=[]
-        seen=set()
-        for a in soup.select('a[href*="/en/match/"]'):
-            href=clean(a.get('href',''))
-            if not href:
-                continue
-            if href.startswith('/'):
-                href='https://matrisx.com'+href
-            if href in seen:
-                continue
-            seen.add(href)
-            node=a
-            for _ in range(3):
-                if getattr(node,'parent',None) is not None:
-                    node=node.parent
-            context=clean(node.get_text(' ',strip=True))[:700] if node else clean(a.get_text(' ',strip=True))
-            items.append({'url':href,'context':context})
-        print(f'MATRIS INDEX V8: {len(items)} match link trovati')
-        return items
-    except Exception as exc:
-        print(f'WARN Matris index: {exc}',file=sys.stderr)
-        return []
 
 def load_existing_board(day: str):
     path=OUT_DIR / f'{day}.json'
