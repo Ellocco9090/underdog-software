@@ -1512,53 +1512,289 @@ def matris_page_payload_v12(html_text: str):
         'dc':dc,
     }
 
-def probe_todaybettingtips_v12(day: str):
-    url=f'https://www.todaybettingtips.com/?date={day}&tab=predictions'
-    try:
-        response=requests.get(
-            url,
-            timeout=18,
-            headers={
-                'User-Agent':'Mozilla/5.0 StepByStep/1.0',
-                'Accept':'text/html,*/*',
-            }
-        )
-        response.raise_for_status()
-        html=response.text
-        soup=BeautifulSoup(html,'html.parser')
-        text=clean(soup.get_text(' ',strip=True))
-        marker=text.lower().find('double chance')
-        snippet=text[max(0,marker-1200):marker+5000] if marker>=0 else text[:5000]
-        print(
-            f'TODAYBETTINGTIPS PROBE {day}: status={response.status_code} '
-            f'html={len(html)} text={len(text)} snippet='+
-            snippet,
-            file=sys.stderr
-        )
+def tbt_normalize_pick_v13(value: str):
+    s=source_plain(value)
 
-        # Logga i primi elementi che contengono una percentuale alta,
-        # così individuiamo la struttura DOM senza alterare la board.
-        hits=[]
-        for node in soup.find_all(['div','article','li','tr','section']):
-            t=clean(node.get_text(' ',strip=True))
-            if (
-                len(t)>=20 and len(t)<=1200 and
-                re.search(r'\b9[0-9](?:[.,]\d+)?\s*%',t) and
-                ('Double Chance' in t or 'Over 1.5' in t)
-            ):
-                hits.append({
-                    'name':node.name,
-                    'class':' '.join(node.get('class') or []),
-                    'text':t[:900],
-                })
-                if len(hits)>=8:
-                    break
-        print(
-            'TODAYBETTINGTIPS DOM '+json.dumps(hits,ensure_ascii=False),
-            file=sys.stderr
+    if 'double chance' in s:
+        if re.search(r'\b1x\b',s):
+            return ('Doppia chance','1X','DC_1X')
+        if re.search(r'\bx2\b',s):
+            return ('Doppia chance','X2','DC_X2')
+        if re.search(r'\b12\b',s):
+            return ('Doppia chance','12','DC_12')
+
+    if 'btts' in s or 'both teams' in s:
+        if re.search(r'\b(no|ng)\b',s):
+            return ('Gol/No Gol','NG','NG')
+        if re.search(r'\b(yes|gg)\b',s):
+            return ('Gol/No Gol','GG','GG')
+
+    if re.search(r'\bover\s*1[.,]5\b|\bover\s*1\.5\b',s):
+        return ('Over/Under','Over 1.5','O15')
+    if re.search(r'\bover\s*2[.,]5\b|\bover\s*2\.5\b',s):
+        return ('Over/Under','Over 2.5','O25')
+    if re.search(r'\bunder\s*2[.,]5\b|\bunder\s*2\.5\b',s):
+        return ('Over/Under','Under 2.5','U25')
+
+    if 'home win' in s:
+        return ('1X2','1','H')
+    if 'away win' in s:
+        return ('1X2','2','A')
+
+    return None
+
+def tbt_parse_match_node_v13(text: str):
+    raw=clean(text)
+
+    # Esempio:
+    # Bayer Leverkusen W - : - Double Chance X2 95.0% Werder Bremen W
+    # Botafogo 2 : 3 Double Chance X2 95.0% Atletico Paranaense
+    m=re.match(
+        r'^(.*?)\s+(-|\d+)\s*:\s*(-|\d+)\s+(.+?)\s+'
+        r'(\d{2,3}(?:[.,]\d+)?)%\s+(.+?)$',
+        raw,
+        re.I
+    )
+    if not m:
+        return None
+
+    home=clean(m.group(1))
+    hs=m.group(2)
+    aas=m.group(3)
+    pick=clean(m.group(4))
+    try:
+        confidence=float(m.group(5).replace(',','.'))
+    except Exception:
+        return None
+    away=clean(m.group(6))
+
+    normalized=tbt_normalize_pick_v13(pick)
+    if not normalized or not home or not away:
+        return None
+
+    market,selection,code=normalized
+
+    score=None
+    if hs!='-' and aas!='-':
+        try:
+            score=(int(hs),int(aas))
+        except Exception:
+            score=None
+
+    return {
+        'home':home,
+        'away':away,
+        'market':market,
+        'selection':selection,
+        'code':code,
+        'confidence':confidence,
+        'score':score,
+    }
+
+def tbt_pick_won_v13(row):
+    score=row.get('score')
+    if not score:
+        return None
+
+    hg,ag=score
+    code=row.get('code')
+
+    if code=='DC_1X': return hg>=ag
+    if code=='DC_X2': return ag>=hg
+    if code=='DC_12': return hg!=ag
+    if code=='NG': return not (hg>0 and ag>0)
+    if code=='GG': return hg>0 and ag>0
+    if code=='O15': return hg+ag>=2
+    if code=='O25': return hg+ag>=3
+    if code=='U25': return hg+ag<=2
+    if code=='H': return hg>ag
+    if code=='A': return ag>hg
+
+    return None
+
+def tbt_fetch_day_v13(day: str):
+    url=f'https://www.todaybettingtips.com/?date={day}&tab=predictions'
+    response=requests.get(
+        url,
+        timeout=15,
+        headers={
+            'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+            'Accept':'text/html,*/*',
+        }
+    )
+    response.raise_for_status()
+    soup=BeautifulSoup(response.text,'html.parser')
+
+    rows=[]
+    for node in soup.select('.pred-match'):
+        parsed=tbt_parse_match_node_v13(
+            node.get_text(' ',strip=True)
         )
+        if parsed:
+            rows.append(parsed)
+    return rows
+
+def tbt_fixture_match_score_v13(record: dict, row: dict):
+    direct=(
+        team_similarity(record.get('home_team',''),row.get('home',''))+
+        team_similarity(record.get('away_team',''),row.get('away',''))
+    )/2
+
+    swapped=(
+        team_similarity(record.get('home_team',''),row.get('away',''))+
+        team_similarity(record.get('away_team',''),row.get('home',''))
+    )/2
+
+    if direct>=.72 and direct>=swapped:
+        return direct,False
+    if swapped>=.82:
+        return swapped,True
+    return 0.0,False
+
+def tbt_adjust_selection_for_swap_v13(market: str, selection: str):
+    if market=='Doppia chance':
+        if selection=='1X': return 'X2'
+        if selection=='X2': return '1X'
+    if market=='1X2':
+        if selection=='1': return '2'
+        if selection=='2': return '1'
+    return selection
+
+def load_todaybettingtips_validated90_v13(records, day: str):
+    try:
+        target=datetime.fromisoformat(day).date()
+    except Exception:
+        return {}
+
+    # 35 giorni: il sito mostra risultati pubblicati con score finale,
+    # così misuriamo realmente la fascia >=90 invece di fidarci del badge.
+    history_days=[
+        (target-timedelta(days=i)).isoformat()
+        for i in range(1,36)
+    ]
+
+    def fetch_hist(d):
+        try:
+            return d,tbt_fetch_day_v13(d)
+        except Exception as exc:
+            print(f'WARN TBT history {d}: {exc}',file=sys.stderr)
+            return d,[]
+
+    history=[]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        jobs=[pool.submit(fetch_hist,d) for d in history_days]
+        for future in as_completed(jobs):
+            _,rows=future.result()
+            history.extend(rows)
+
+    # Calibrazione per stesso mercato/segno e solo fascia di confidenza >=90.
+    stats={}
+    for row in history:
+        if float(row.get('confidence') or 0)<90:
+            continue
+        won=tbt_pick_won_v13(row)
+        if won is None:
+            continue
+        code=row.get('code')
+        bucket=stats.setdefault(code,{'n':0,'w':0})
+        bucket['n']+=1
+        bucket['w']+=int(bool(won))
+
+    validated={}
+    for code,bucket in stats.items():
+        n=bucket['n']
+        w=bucket['w']
+        rate=(w/n*100) if n else 0
+        # Requisito utente: il segmento usato deve aver davvero fatto >=90%.
+        # Richiediamo anche un campione minimo per non chiamare 2/2 "95%".
+        if n>=15 and rate>=90.0:
+            validated[code]={
+                'historical_win_rate':round(rate,1),
+                'sample':n,
+                'wins':w,
+            }
+
+    print(
+        'TBT V13 BACKTEST '+day+' '+
+        json.dumps(
+            {
+                code:{
+                    'n':v['n'],
+                    'w':v['w'],
+                    'rate':round(v['w']/v['n']*100,1) if v['n'] else 0
+                }
+                for code,v in stats.items()
+            },
+            ensure_ascii=False
+        )
+    )
+    print(
+        'TBT V13 QUALIFIED '+day+' '+
+        json.dumps(validated,ensure_ascii=False)
+    )
+
+    if not validated:
+        return {}
+
+    try:
+        today_rows=tbt_fetch_day_v13(day)
     except Exception as exc:
-        print(f'WARN TodayBettingTips probe {day}: {exc}',file=sys.stderr)
+        print(f'WARN TBT today {day}: {exc}',file=sys.stderr)
+        return {}
+
+    live=[
+        row for row in today_rows
+        if float(row.get('confidence') or 0)>=90 and
+        row.get('score') is None and
+        row.get('code') in validated
+    ]
+
+    support={}
+    for record in records:
+        best=None
+        for row in live:
+            if str(record.get('market_name') or '')!=row.get('market'):
+                continue
+
+            score,swapped=tbt_fixture_match_score_v13(record,row)
+            if score<=0:
+                continue
+
+            row_sel=tbt_adjust_selection_for_swap_v13(
+                row.get('market'),
+                row.get('selection')
+            ) if swapped else row.get('selection')
+
+            if str(record.get('selection_column') or '')!=str(row_sel or ''):
+                continue
+
+            if best is None or score>best[0]:
+                best=(score,row)
+
+        if not best:
+            continue
+
+        _,row=best
+        hist=validated[row['code']]
+        key=(
+            record['event_id'],
+            record['market_name'],
+            record['selection_column']
+        )
+        support[key]={
+            'source':'todaybettingtips_verified90',
+            'prediction_confidence':round(float(row['confidence']),1),
+            'historical_win_rate':float(hist['historical_win_rate']),
+            'sample':int(hist['sample']),
+            'wins':int(hist['wins']),
+        }
+
+    print(
+        f'VALIDATED90 TodayBettingTips V13 {day}: '
+        f'{len(support)} selezioni'
+    )
+    return support
+
 
 def load_matris_high_confidence_dc_v12(records, day: str):
     candidates=[
@@ -1929,7 +2165,7 @@ def enrich_records_with_validated90_v9(records, day: str):
     # Le altre fonti restano controlli secondari/tie-breaker.
     matris=load_matris_high_confidence_dc_v12(records,day)
     fpai=load_footballprediction_ai_over15_v9(records)
-    ganhar=load_ganhar_dc90_v11(records,day)
+    tbt=load_todaybettingtips_validated90_v13(records,day)
 
     for r in records:
         key=(r['event_id'],r['market_name'],r['selection_column'])
@@ -1938,8 +2174,8 @@ def enrich_records_with_validated90_v9(records, day: str):
             hits.append(matris[key])
         if key in fpai:
             hits.append(fpai[key])
-        if key in ganhar:
-            hits.append(ganhar[key])
+        if key in tbt:
+            hits.append(tbt[key])
 
         r['_validated90SupportCount']=len(hits)
         r['_validated90Sources']=[h['source'] for h in hits]
@@ -2657,8 +2893,6 @@ def build_day(day: str, make_latest: bool):
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
     else:
-        if day == datetime.now(ROME).date().isoformat():
-            probe_todaybettingtips_v12(day)
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
         verified=enrich_records_with_validated90_v9(verified,day)
