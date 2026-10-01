@@ -8,6 +8,7 @@ import sys
 import time
 import unicodedata
 from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -21,6 +22,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 ROME = ZoneInfo('Europe/Rome')
 OUT_DIR = Path(__file__).resolve().parent
 MONTHS = {1:'gen',2:'feb',3:'mar',4:'apr',5:'mag',6:'giu',7:'lug',8:'ago',9:'set',10:'ott',11:'nov',12:'dic'}
+
+BETFLAG_API = 'https://sportservice.betflag.it'
+BETFLAG_HEADERS = {
+    'x-api-version':'1.0',
+    'X-Auth-Token':'',
+    'X-Brand':'3',
+    'X-IdCanale':'1',
+    'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+    'Accept':'application/json,text/plain,*/*',
+}
 
 def clean(s: str) -> str:
     return re.sub(r'\s+', ' ', str(s or '').replace('\xa0',' ')).strip()
@@ -723,6 +734,252 @@ def counts(records):
             result[r['market_name']]+=1
     return result
 
+def betflag_market_kind(name: str) -> str | None:
+    n = ascii_norm(name).upper()
+    if n == 'DC' or 'DOPPIA CHANCE' in n:
+        return 'Doppia chance'
+    if n == '1X2' or 'ESITO FINALE' in n:
+        return '1X2'
+    if n == 'U O' or 'UNDER OVER' in n or ('UNDER' in n and 'OVER' in n):
+        return 'Over/Under'
+    if n == 'GG NG' or ('GOL' in n and 'NO GOL' in n) or ('GOAL' in n and 'NO GOAL' in n):
+        return 'Gol/No Gol'
+    return None
+
+def betflag_norm_sign(value: str) -> str:
+    n = ascii_norm(value).upper().replace(' ', '')
+    n = n.replace('DOPPIACHANCE','')
+    if n in {'GOAL','GOL','BTS','BTTS','GG'}:
+        return 'GG'
+    if n in {'NOGOAL','NOGOL','NG'}:
+        return 'NG'
+    if n in {'HOME','CASA'}:
+        return '1'
+    if n in {'AWAY','OSPITE'}:
+        return '2'
+    if n in {'DRAW','PAREGGIO'}:
+        return 'X'
+    return n
+
+def parse_betflag_line(value) -> float | None:
+    txt = str(value or '').replace(',','.')
+    nums = re.findall(r'\d+(?:\.\d+)?', txt)
+    if not nums:
+        return None
+    try:
+        n=float(nums[-1])
+    except Exception:
+        return None
+    if n > 10 and n in (15,25,35,45,55,65):
+        n=n/10
+    return n if 0 <= n <= 20 else None
+
+def betflag_selection_map(event: dict):
+    out={}
+    for market in (event.get('mmkW') or {}).values():
+        if not isinstance(market,dict):
+            continue
+        market_name=clean(market.get('mn',''))
+        kind=betflag_market_kind(market_name)
+        if not kind:
+            continue
+        for line,data in (market.get('spd') or {}).items():
+            if not isinstance(data,dict):
+                continue
+            line_num=parse_betflag_line(line)
+            for sign in data.get('asl') or []:
+                if not isinstance(sign,dict):
+                    continue
+                raw_sign=clean(sign.get('sn',''))
+                try:
+                    odd=float(sign.get('ov'))
+                except Exception:
+                    continue
+                if not raw_sign or not (1.01 < odd <= 30):
+                    continue
+                ns=betflag_norm_sign(raw_sign)
+
+                key=None
+                if kind == 'Doppia chance' and ns in {'1X','12','X2'}:
+                    key=(kind,ns)
+                elif kind == '1X2' and ns in {'1','X','2'}:
+                    key=(kind,ns)
+                elif kind == 'Gol/No Gol' and ns in {'GG','NG'}:
+                    key=(kind,ns)
+                elif kind == 'Over/Under':
+                    direction=None
+                    if 'OVER' in ns or ns in {'O','OV'}:
+                        direction='Over'
+                    elif 'UNDER' in ns or ns in {'U','UN'}:
+                        direction='Under'
+                    sign_line=parse_betflag_line(raw_sign)
+                    use_line=sign_line if sign_line is not None else line_num
+                    if direction and use_line is not None:
+                        key=(kind,f'{direction} {use_line:.1f}')
+
+                if key:
+                    prev=out.get(key)
+                    if prev is None or odd < prev:
+                        out[key]=round(odd,3)
+    return out
+
+def betflag_parse_event(event: dict, day: str):
+    name=clean(event.get('en',''))
+    cut=name.find(' - ')
+    if cut < 1:
+        teams=event.get('teams') or []
+        home=clean((teams[0] or {}).get('nm','')) if len(teams)>0 and isinstance(teams[0],dict) else ''
+        away=clean((teams[1] or {}).get('nm','')) if len(teams)>1 and isinstance(teams[1],dict) else ''
+    else:
+        home=name[:cut].strip()
+        away=name[cut+3:].strip()
+    if not home or not away:
+        return None
+
+    raw=clean(event.get('ed',''))
+    mt=re.search(r'(\d{2})-(\d{2})-(\d{4})\s+(\d{2}:\d{2})',raw)
+    if not mt:
+        return None
+    d=f'{mt.group(3)}-{mt.group(2)}-{mt.group(1)}'
+    if d != day:
+        return None
+    kickoff=kickoff_iso(day,mt.group(4))
+    selections=betflag_selection_map(event)
+    if not selections:
+        return None
+    return {
+        'home_team':home,
+        'away_team':away,
+        'event_time':kickoff,
+        'event_id':str(event.get('ei') or f'{day}|{home}|{away}'),
+        'league_name':clean(event.get('td','')) or '—',
+        'country':'—',
+        'betflag_event_id':int(event.get('ei') or 0),
+        'betflag_tournament_id':int(event.get('ti') or 0),
+        'selections':selections,
+    }
+
+def fetch_betflag_playable(day: str):
+    session=requests.Session()
+    session.headers.update(BETFLAG_HEADERS)
+
+    program=session.get(
+        BETFLAG_API+'/api/sport/pregame/getProgram?channelId=1',
+        timeout=22
+    )
+    program.raise_for_status()
+    data=program.json()
+    football=next((x for x in data if int(x.get('id') or 0)==1),None)
+    if not football:
+        raise RuntimeError('Betflag calcio non trovato')
+
+    tournament_ids=[]
+    for country in football.get('lc') or []:
+        for tournament in country.get('lts') or []:
+            try:
+                tid=int(tournament.get('id') or 0)
+            except Exception:
+                continue
+            counts=tournament.get('nEfT') or []
+            total=int(tournament.get('ne') or 0)
+            if isinstance(counts,list) and counts:
+                total=max(total,*[int(x or 0) for x in counts if str(x or '').isdigit()])
+            if 0 < tid < 1_000_000_000 and total > 0:
+                tournament_ids.append(tid)
+
+    tournament_ids=sorted(set(tournament_ids))
+    fixtures=[]
+
+    def one(tid):
+        url=(
+            BETFLAG_API+
+            f'/api/sport/pregame/getOverviewEventsAams/0/1/79/{tid}/0/0/0?channelId=1'
+        )
+        response=requests.get(url,headers=BETFLAG_HEADERS,timeout=18)
+        response.raise_for_status()
+        body=response.json()
+        return [
+            item for item in (
+                betflag_parse_event(e,day)
+                for e in (body.get('leo') or [])
+            )
+            if item
+        ]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        jobs={pool.submit(one,tid):tid for tid in tournament_ids}
+        for future in as_completed(jobs):
+            try:
+                fixtures.extend(future.result())
+            except Exception as exc:
+                print(f'WARN Betflag torneo {jobs[future]}: {exc}',file=sys.stderr)
+
+    print(f'BETFLAG {day}: {len(fixtures)} fixture con mercati giocabili')
+    return fixtures
+
+def betflag_match_for_record(record: dict, fixtures):
+    target={
+        'home_team':record.get('home_team',''),
+        'away_team':record.get('away_team',''),
+        'event_time':record.get('event_time',''),
+    }
+    market=record.get('market_name','')
+    outcome=record.get('selection_column','')
+    key=(market,outcome)
+
+    best=None
+    best_score=-1.0
+    for fixture in fixtures:
+        if key not in (fixture.get('selections') or {}):
+            continue
+        try:
+            ta=datetime.fromisoformat(str(target['event_time']))
+            tb=datetime.fromisoformat(str(fixture['event_time']))
+            if abs((ta-tb).total_seconds()) > 75*60:
+                continue
+        except Exception:
+            continue
+
+        direct=(
+            team_similarity(target['home_team'],fixture['home_team'])+
+            team_similarity(target['away_team'],fixture['away_team'])
+        )/2
+        swapped=(
+            team_similarity(target['home_team'],fixture['away_team'])+
+            team_similarity(target['away_team'],fixture['home_team'])
+        )/2
+        score=max(direct,swapped-.08)
+        if score >= .70 and score > best_score:
+            best_score=score
+            best=fixture
+
+    return best
+
+def filter_records_playable_on_betflag(records, fixtures):
+    playable=[]
+    matched_fixtures=set()
+    for record in records:
+        fixture=betflag_match_for_record(record,fixtures)
+        if not fixture:
+            continue
+        key=(record.get('market_name',''),record.get('selection_column',''))
+        odd=(fixture.get('selections') or {}).get(key)
+        if odd is None:
+            continue
+        item=dict(record)
+        item['odd']=round(float(odd),3)
+        item['_betflagPlayable']=True
+        item['_betflagEventId']=fixture.get('betflag_event_id')
+        item['_betflagTournamentId']=fixture.get('betflag_tournament_id')
+        item['_betflagCheckedAt']=datetime.now(ROME).isoformat()
+        playable.append(item)
+        matched_fixtures.add(fixture.get('betflag_event_id'))
+    print(
+        f'BETFLAG MATCH {datetime.now(ROME).isoformat()}: '
+        f'{len(playable)} selezioni su {len(matched_fixtures)} fixture'
+    )
+    return playable
+
 def load_existing_board(day: str):
     path = OUT_DIR / f'{day}.json'
     if not path.exists():
@@ -731,7 +988,16 @@ def load_existing_board(day: str):
         payload = json.loads(path.read_text(encoding='utf-8'))
         board = payload.get('board')
         roads = board.get('roads') if isinstance(board,dict) else None
-        if isinstance(roads,list) and len(roads) == 5 and all(len(r.get('selections',[])) == 2 for r in roads):
+        if (
+            isinstance(roads,list) and
+            len(roads) == 5 and
+            all(len(r.get('selections',[])) == 2 for r in roads) and
+            board.get('playability_source') == 'betflag-pregame-v1' and
+            all(
+                all(bool(s.get('_betflagPlayable')) for s in r.get('selections',[]))
+                for r in roads
+            )
+        ):
             return board
     except Exception:
         return None
@@ -754,13 +1020,17 @@ def board_record_score(record: dict) -> float:
         return -999
     return conf*55 + (1/odd)*35 + board_market_bonus(record) - max(0,odd-1.35)*12
 
-def build_canonical_board(records, day: str, now: datetime):
+def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
     # La board è costruita UNA SOLA VOLTA e poi conservata nei run successivi.
     # Tutti i dispositivi scaricano quindi esattamente le stesse 5 strade.
+    # Prima condizione: la partita + il mercato + il segno devono
+    # essere realmente presenti nel palinsesto Betflag.
+    verified_records=filter_records_playable_on_betflag(records,betflag_fixtures)
+
     future=[]
     cutoff = now + timedelta(minutes=30)
 
-    for r in records:
+    for r in verified_records:
         try:
             kickoff = datetime.fromisoformat(str(r.get('event_time','')))
             odd = float(r.get('odd') or 0)
@@ -858,6 +1128,10 @@ def build_canonical_board(records, day: str, now: datetime):
                 'odd':r.get('odd'),
                 '_marketConfidence':r.get('_marketConfidence'),
                 '_serverFeed':True,
+                '_betflagPlayable':True,
+                '_betflagEventId':r.get('_betflagEventId'),
+                '_betflagTournamentId':r.get('_betflagTournamentId'),
+                '_betflagCheckedAt':r.get('_betflagCheckedAt'),
             })
         roads.append({
             'road':road,
@@ -866,10 +1140,12 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':1,
+        'version':2,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
+        'playability_source':'betflag-pregame-v1',
+        'playability_checked_at':now.isoformat(),
         'roads':roads,
     }
 
@@ -885,9 +1161,32 @@ def build_day(day: str, make_latest: bool):
         raise RuntimeError(f'{day}: feed incompleto: {len(records)} record, {c}')
 
     now=datetime.now(ROME)
-    # Board centrale anche per DOMANI: serve quando un WIN/LOSS
-    # fa avanzare subito una strada al giorno successivo.
-    board=load_existing_board(day) or build_canonical_board(records,day,now)
+
+    # Board centrale anche per DOMANI, ma SOLO con eventi/mercati
+    # effettivamente giocabili su Betflag.
+    board=load_existing_board(day)
+
+    if board is None:
+        try:
+            betflag_fixtures=fetch_betflag_playable(day)
+            board=build_canonical_board(
+                records,
+                day,
+                now,
+                betflag_fixtures
+            )
+            if board is None:
+                print(
+                    f'WARN {day}: Betflag verificato ma non ci sono '
+                    '10 selezioni compatibili per 5 strade',
+                    file=sys.stderr
+                )
+        except Exception as exc:
+            print(
+                f'WARN Betflag board {day}: {exc}',
+                file=sys.stderr
+            )
+            board=None
 
     payload={
         'date':day,
