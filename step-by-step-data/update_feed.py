@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -998,54 +999,187 @@ def filter_records_playable_on_betflag(records, fixtures):
     )
     return playable
 
-def probe_odd24_betflag_modal(records):
-    candidate=next(
-        (
-            r for r in records
-            if r.get('_modalUrl') and
-            1.05 <= float(r.get('odd') or 0) <= 1.60 and
-            r.get('selection_column') not in ('X','Under 1.5')
-        ),
-        None
+def modal_header_match(header: str, outcome: str) -> bool:
+    h=ascii_norm(header).upper().replace(' ','')
+    o=ascii_norm(outcome).upper().replace(' ','')
+
+    if o in {'1','X','2','1X','12','X2','GG','NG'}:
+        return h == o
+
+    if o.startswith('OVER'):
+        return (
+            'OVER' in h or
+            h in {'O','OV'}
+        )
+
+    if o.startswith('UNDER'):
+        return (
+            'UNDER' in h or
+            h in {'U','UN'}
+        )
+
+    return False
+
+def betflag_quotes_from_modal(html_text: str):
+    soup=BeautifulSoup(html_text,'html.parser')
+    found={}
+
+    for table in soup.select('table.odm-table'):
+        headers=[
+            clean(th.get_text(' ',strip=True))
+            for th in table.select('thead th')
+        ]
+
+        if not headers:
+            continue
+
+        for tr in table.select('tbody tr'):
+            tds=tr.find_all('td',recursive=False)
+            if not tds:
+                continue
+
+            provider_cell=tds[0]
+            provider=clean(
+                provider_cell.get('title') or
+                provider_cell.get_text(' ',strip=True)
+            ).upper()
+
+            if provider != 'BETFLAG':
+                continue
+
+            # Colonna 0=operatore, ultima=payout.
+            for idx in range(1,min(len(tds)-1,len(headers)-1)):
+                label=headers[idx]
+                raw=clean(tds[idx].get_text(' ',strip=True))
+                m=re.search(r'(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)',raw)
+                if not m:
+                    continue
+                try:
+                    odd=float(m.group(1).replace(',','.'))
+                except Exception:
+                    continue
+                if 1.01 < odd <= 30:
+                    found[label]=round(odd,3)
+
+    return found
+
+def verify_records_on_odd24_betflag(records, day: str, now: datetime):
+    cutoff=now+timedelta(minutes=45)
+
+    # Raggruppa per modal mercato: una richiesta verifica tutte le uscite
+    # di quel mercato per quella partita.
+    groups={}
+    for record in records:
+        modal=record.get('_modalUrl')
+        if not modal:
+            continue
+
+        try:
+            kickoff=datetime.fromisoformat(str(record.get('event_time','')))
+        except Exception:
+            continue
+
+        if kickoff < cutoff:
+            continue
+
+        if record.get('selection_column') in ('X','Under 1.5'):
+            continue
+
+        # Il valore massimo visibile aiuta solo a ridurre richieste inutili.
+        # Betflag può avere quota inferiore; teniamo quindi un margine ampio.
+        try:
+            overview_odd=float(record.get('odd') or 0)
+        except Exception:
+            continue
+        if not (1.03 <= overview_odd <= 2.30):
+            continue
+
+        groups.setdefault(str(modal),[]).append(record)
+
+    if not groups:
+        return []
+
+    headers={
+        'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+        'Accept':'text/html,*/*',
+        'Referer':'https://odd24.io/odds',
+    }
+
+    def fetch_modal(modal):
+        url=modal if str(modal).startswith('http') else 'https://odd24.io'+str(modal)
+        response=requests.get(url,timeout=16,headers=headers)
+        response.raise_for_status()
+        return modal,betflag_quotes_from_modal(response.text)
+
+    modal_quotes={}
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        jobs={pool.submit(fetch_modal,modal):modal for modal in groups}
+        for future in as_completed(jobs):
+            modal=jobs[future]
+            try:
+                key,quotes=future.result()
+                modal_quotes[key]=quotes
+            except Exception as exc:
+                print(f'WARN Odd24 modal {modal}: {exc}',file=sys.stderr)
+
+    verified=[]
+    checked_at=datetime.now(ROME).isoformat()
+
+    for modal,rows in groups.items():
+        quotes=modal_quotes.get(modal) or {}
+        if not quotes:
+            continue
+
+        for record in rows:
+            outcome=str(record.get('selection_column') or '')
+            matched_odd=None
+
+            for header,odd in quotes.items():
+                if modal_header_match(header,outcome):
+                    matched_odd=odd
+                    break
+
+            if matched_odd is None:
+                continue
+
+            item=dict(record)
+            item['odd']=round(float(matched_odd),3)
+            item['_betflagPlayable']=True
+            item['_bookmaker']='Betflag'
+            item['_betflagOdd']=round(float(matched_odd),3)
+            item['_betflagCheckedAt']=checked_at
+            item['_playabilitySource']='odd24-modal-betflag-v1'
+            verified.append(item)
+
+    print(
+        f'BETFLAG MODAL {day}: {len(verified)} selezioni verificate '
+        f'su {len(groups)} mercati controllati'
     )
-    if not candidate:
-        return
-    try:
-        url='https://odd24.io'+str(candidate['_modalUrl'])
-        response=requests.get(
-            url,
-            timeout=15,
-            headers={'User-Agent':'Mozilla/5.0 StepByStep/1.0','Accept':'text/html,*/*'}
-        )
-        print(
-            'ODD24 MODAL PROBE status='+str(response.status_code)+
-            ' url='+url+
-            ' body='+clean(response.text[:5000]),
-            file=sys.stderr
-        )
-    except Exception as exc:
-        print(f'WARN modal probe: {exc}',file=sys.stderr)
+
+    return verified
+
 
 def load_existing_board(day: str):
     path = OUT_DIR / f'{day}.json'
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding='utf-8'))
-        board = payload.get('board')
-        roads = board.get('roads') if isinstance(board,dict) else None
+        payload=json.loads(path.read_text(encoding='utf-8'))
+        board=payload.get('board')
+        roads=board.get('roads') if isinstance(board,dict) else None
+
         if (
             isinstance(roads,list) and
-            len(roads) == 5 and
-            all(len(r.get('selections',[])) == 2 for r in roads) and
-            int(board.get('version') or 0) >= 4 and
-            board.get('playability_source') in {
-                'betflag-pregame-v1',
-                'odd24-betflag-best-v1',
-                'odd24-modal-probe-fallback'
-            } and
+            len(roads)==5 and
+            all(len(r.get('selections',[]))==2 for r in roads) and
+            int(board.get('version') or 0)>=5 and
+            board.get('playability_source')=='odd24-modal-betflag-v1' and
             all(
-                all(bool(sel.get('_betflagPlayable')) for sel in road.get('selections',[]))
+                all(
+                    bool(sel.get('_betflagPlayable')) and
+                    sel.get('_bookmaker')=='Betflag'
+                    for sel in road.get('selections',[])
+                )
                 for road in roads
             )
         ):
@@ -1053,6 +1187,7 @@ def load_existing_board(day: str):
     except Exception:
         return None
     return None
+
 
 def board_market_bonus(record: dict) -> float:
     market = record.get('market_name','')
@@ -1071,28 +1206,15 @@ def board_record_score(record: dict) -> float:
         return -999
     return conf*55 + (1/odd)*35 + board_market_bonus(record) - max(0,odd-1.35)*12
 
-def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
-    # La board è costruita UNA SOLA VOLTA e poi conservata nei run successivi.
-    # Tutti i dispositivi scaricano quindi esattamente le stesse 5 strade.
-    # Prima condizione: la partita + il mercato + il segno devono
-    # essere realmente presenti nel palinsesto Betflag.
-    if betflag_fixtures:
-        verified_records=filter_records_playable_on_betflag(
-            records,
-            betflag_fixtures
-        )
-        playability_source='betflag-pregame-v1'
-    else:
-        betflag_cells=[
-            r for r in records
-            if bool(r.get('_betflagCell'))
-        ]
-        if betflag_cells:
-            verified_records=betflag_cells
-            playability_source='odd24-betflag-best-v1'
-        else:
-            verified_records=list(records)
-            playability_source='odd24-modal-probe-fallback'
+def build_canonical_board(records, day: str, now: datetime):
+    # Qui arrivano SOLO selezioni confermate nel market-modal Odd24
+    # con riga operatore BETFLAG e quota Betflag reale.
+    verified_records=[
+        r for r in records
+        if bool(r.get('_betflagPlayable')) and
+        r.get('_bookmaker')=='Betflag'
+    ]
+    playability_source='odd24-modal-betflag-v1'
 
     print(
         f'PLAYABLE {day}: {len(verified_records)} selezioni '
@@ -1200,14 +1322,11 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
                 'odd':r.get('odd'),
                 '_marketConfidence':r.get('_marketConfidence'),
                 '_serverFeed':True,
-                '_betflagPlayable':bool(
-                    r.get('_betflagPlayable') or
-                    r.get('_betflagCell')
-                ),
+                '_betflagPlayable':bool(r.get('_betflagPlayable')),
                 '_bookmaker':'Betflag',
-                '_betflagEventId':r.get('_betflagEventId'),
-                '_betflagTournamentId':r.get('_betflagTournamentId'),
+                '_betflagOdd':r.get('_betflagOdd'),
                 '_betflagCheckedAt':r.get('_betflagCheckedAt'),
+                '_playabilitySource':'odd24-modal-betflag-v1',
             })
         roads.append({
             'road':road,
@@ -1216,7 +1335,7 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
         })
 
     return {
-        'version':4,
+        'version':5,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
@@ -1230,7 +1349,6 @@ def build_day(day: str, make_latest: bool):
     print(f'DOM rows {day}: {len(rows)}')
 
     records=unique(parse_rows(rows,day))
-    probe_odd24_betflag_modal(records)
     records,stat_fixtures,stat_records=enrich_records_with_stats(records,day)
     c=counts(records)
 
@@ -1238,43 +1356,18 @@ def build_day(day: str, make_latest: bool):
         raise RuntimeError(f'{day}: feed incompleto: {len(records)} record, {c}')
 
     now=datetime.now(ROME)
-
-    # Board centrale anche per DOMANI, ma SOLO con eventi/mercati
-    # effettivamente giocabili su Betflag.
     board=load_existing_board(day)
 
     if board is None:
-        try:
-            betflag_fixtures=fetch_betflag_playable(day)
-            board=build_canonical_board(
-                records,
-                day,
-                now,
-                betflag_fixtures
-            )
-            if board is None:
-                print(
-                    f'WARN {day}: Betflag verificato ma non ci sono '
-                    '10 selezioni compatibili per 5 strade',
-                    file=sys.stderr
-                )
-        except Exception as exc:
+        verified=verify_records_on_odd24_betflag(records,day,now)
+        board=build_canonical_board(verified,day,now)
+
+        if board is None:
             print(
-                f'WARN Betflag board {day}: {exc}',
+                f'WARN {day}: non ci sono 10 selezioni Betflag '
+                'verificate e compatibili per costruire 5 strade',
                 file=sys.stderr
             )
-            board=build_canonical_board(
-                records,
-                day,
-                now,
-                None
-            )
-            if board is None:
-                print(
-                    f'WARN {day}: meno di 10 selezioni Betflag '
-                    'giocabili per costruire 5 strade',
-                    file=sys.stderr
-                )
 
     payload={
         'date':day,
@@ -1290,10 +1383,15 @@ def build_day(day: str, make_latest: bool):
     OUT_DIR.mkdir(parents=True,exist_ok=True)
     data=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
     (OUT_DIR/f'{day}.json').write_text(data,encoding='utf-8')
+
     if make_latest:
         (OUT_DIR/'latest.json').write_text(data,encoding='utf-8')
 
-    print(f'OK {day}: {len(records)} records {c} | stats fixtures={stat_fixtures} records={stat_records}')
+    print(
+        f'OK {day}: {len(records)} records {c} | '
+        f'stats fixtures={stat_fixtures} records={stat_records}'
+    )
+
 
 def main():
     now=datetime.now(ROME)
