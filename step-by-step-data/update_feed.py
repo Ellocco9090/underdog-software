@@ -68,6 +68,8 @@ def add_record(out, base, market, outcome, value, confidence):
     n = first_odd(value)
     if n is None:
         return
+    raw_value=str(value or '')
+    is_betflag=bool(re.search(r'\\bBetflag\\b',raw_value,re.I))
     out.append({
         'home_team': base['home'],
         'away_team': base['away'],
@@ -80,6 +82,8 @@ def add_record(out, base, market, outcome, value, confidence):
         'odd': round(n,3),
         '_marketConfidence': confidence,
         '_serverFeed': True,
+        '_bookmaker': 'Betflag' if is_betflag else None,
+        '_betflagCell': is_betflag,
     })
 
 def split_region(line: str):
@@ -630,28 +634,6 @@ def chrome_rows(day: str, attempts: int = 3):
             driver.set_page_load_timeout(35)
             driver.get(url)
 
-            if attempt == 1:
-                try:
-                    provider_debug = driver.execute_script("""
-                        const out=[];
-                        for(const s of document.querySelectorAll('select')){
-                          const label=(s.id||'')+' '+(s.name||'')+' '+(s.getAttribute('aria-label')||'');
-                          const opts=[...s.options].map(o=>({text:(o.textContent||'').trim(),value:o.value}));
-                          if(/provider|book|operatore|concession|quota/i.test(label) || opts.some(o=>/betflag/i.test(o.text+' '+o.value))){
-                            out.push({label,options:opts.slice(0,120)});
-                          }
-                        }
-                        const texts=[...document.querySelectorAll('label,button,[role=option]')]
-                          .map(x=>(x.textContent||'').trim())
-                          .filter(x=>/betflag/i.test(x))
-                          .slice(0,40);
-                        return {selects:out,texts};
-                    """)
-                    if provider_debug and (provider_debug.get('selects') or provider_debug.get('texts')):
-                        print('ODD24 PROVIDER DEBUG '+json.dumps(provider_debug,ensure_ascii=False),file=sys.stderr)
-                except Exception as exc:
-                    print(f'WARN provider debug: {exc}',file=sys.stderr)
-
             def count_rows(d):
                 try:
                     return d.execute_script("""
@@ -1014,7 +996,15 @@ def load_existing_board(day: str):
             isinstance(roads,list) and
             len(roads) == 5 and
             all(len(r.get('selections',[])) == 2 for r in roads) and
-            int(board.get('version') or 0) >= 2
+            int(board.get('version') or 0) >= 3 and
+            board.get('playability_source') in {
+                'betflag-pregame-v1',
+                'odd24-betflag-cell-v1'
+            } and
+            all(
+                all(bool(sel.get('_betflagPlayable')) for sel in road.get('selections',[]))
+                for road in roads
+            )
         ):
             return board
     except Exception:
@@ -1043,10 +1033,22 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
     # Tutti i dispositivi scaricano quindi esattamente le stesse 5 strade.
     # Prima condizione: la partita + il mercato + il segno devono
     # essere realmente presenti nel palinsesto Betflag.
-    verified_records=(
-        filter_records_playable_on_betflag(records,betflag_fixtures)
-        if betflag_fixtures
-        else list(records)
+    if betflag_fixtures:
+        verified_records=filter_records_playable_on_betflag(
+            records,
+            betflag_fixtures
+        )
+        playability_source='betflag-pregame-v1'
+    else:
+        verified_records=[
+            r for r in records
+            if bool(r.get('_betflagCell'))
+        ]
+        playability_source='odd24-betflag-cell-v1'
+
+    print(
+        f'PLAYABLE {day}: {len(verified_records)} selezioni '
+        f'fonte={playability_source}'
     )
 
     future=[]
@@ -1150,7 +1152,11 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
                 'odd':r.get('odd'),
                 '_marketConfidence':r.get('_marketConfidence'),
                 '_serverFeed':True,
-                '_betflagPlayable':bool(r.get('_betflagPlayable')),
+                '_betflagPlayable':bool(
+                    r.get('_betflagPlayable') or
+                    r.get('_betflagCell')
+                ),
+                '_bookmaker':'Betflag',
                 '_betflagEventId':r.get('_betflagEventId'),
                 '_betflagTournamentId':r.get('_betflagTournamentId'),
                 '_betflagCheckedAt':r.get('_betflagCheckedAt'),
@@ -1162,15 +1168,11 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
         })
 
     return {
-        'version':2,
+        'version':3,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
-        'playability_source':(
-            'betflag-pregame-v1'
-            if betflag_fixtures
-            else 'odd24-fallback-v1'
-        ),
+        'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
         'roads':roads,
     }
@@ -1218,6 +1220,12 @@ def build_day(day: str, make_latest: bool):
                 now,
                 None
             )
+            if board is None:
+                print(
+                    f'WARN {day}: meno di 10 selezioni Betflag '
+                    'giocabili per costruire 5 strade',
+                    file=sys.stderr
+                )
 
     payload={
         'date':day,
