@@ -1681,41 +1681,35 @@ def load_ganhar_dc90_v11(records, day: str):
 
     for sign,market in market_map.items():
         direct=f'https://www.ganhar.pt/en/predictions?date={day}&market={market}'
-        bare=f'https://ganhar.pt/en/predictions?date={day}&market={market}'
-        pt=f'https://ganhar.pt/pt/previsoes?date={day}&market={market}'
-        urls=[
-            direct,
-            bare,
-            pt,
-            'https://r.jina.ai/http://ganhar.pt/en/predictions?date='+day+'&market='+market,
-            'https://r.jina.ai/https://ganhar.pt/en/predictions?date='+day+'&market='+market,
-        ]
         errors=[]
-        for url in urls:
-            try:
-                response=requests.get(url,headers=headers,timeout=20)
-                response.raise_for_status()
-                raw=response.text
-                if 'r.jina.ai/' in url:
-                    page=source_plain(raw)
-                else:
-                    page=source_plain(
-                        BeautifulSoup(raw,'html.parser').get_text(' ',strip=True)
-                    )
-                if len(page)<500:
-                    raise RuntimeError('pagina troppo corta')
-                pages[sign]=page
-                break
-            except Exception as exc:
-                errors.append(str(exc))
+
+        # Tentativo HTTP breve.
+        try:
+            response=requests.get(
+                direct,
+                headers=headers,
+                timeout=7
+            )
+            response.raise_for_status()
+            page=source_plain(
+                BeautifulSoup(
+                    response.text,
+                    'html.parser'
+                ).get_text(' ',strip=True)
+            )
+            if len(page)<500 or '%' not in page:
+                raise RuntimeError('pagina troppo corta')
+            pages[sign]=page
+        except Exception as exc:
+            errors.append('http: '+str(exc))
+
+        # Fallback browser: il sito può respingere requests dal runner,
+        # mentre la pagina pubblica si apre correttamente in Chrome.
         if sign not in pages:
-            # Fallback browser: Ganhar può rispondere 502 alle richieste HTTP
-            # del runner ma la pagina pubblica viene caricata normalmente
-            # dal browser. Leggiamo soltanto il testo già visibile.
             driver=None
             try:
                 driver=webdriver.Chrome(options=make_options())
-                driver.set_page_load_timeout(35)
+                driver.set_page_load_timeout(30)
                 driver.get(direct)
 
                 def body_ready(d):
@@ -1723,13 +1717,17 @@ def load_ganhar_dc90_v11(records, day: str):
                         body=d.execute_script(
                             "return document.body ? document.body.innerText : '';"
                         ) or ''
-                        return body if len(body)>500 and '%' in body else False
+                        return body if (
+                            len(body)>500 and
+                            '%' in body and
+                            'Predictions' in body
+                        ) else False
                     except Exception:
                         return False
 
                 body=WebDriverWait(
                     driver,
-                    25,
+                    22,
                     poll_frequency=1
                 ).until(body_ready)
 
