@@ -1509,6 +1509,16 @@ def load_matris_high_confidence_dc_v9(records):
         if len(label)>len(unique_links.get(url,'')):
             unique_links[url]=label
 
+    print(
+        f'MATRIS DISCOVERY: leagues={len(league_urls)} links={len(unique_links)} '
+        f'candidates={len(candidates)}'
+    )
+    if unique_links:
+        print(
+            'MATRIS SAMPLE: '+
+            json.dumps(list(unique_links.items())[:12],ensure_ascii=False)[:9000]
+        )
+
     event_to_url={}
     for r in candidates:
         for url,label in unique_links.items():
