@@ -69,7 +69,7 @@ def add_record(out, base, market, outcome, value, confidence):
     if n is None:
         return
     raw_value=str(value or '')
-    is_betflag=bool(re.search(r'\\bBetflag\\b',raw_value,re.I))
+    is_betflag='betflag' in raw_value.lower()
     out.append({
         'home_team': base['home'],
         'away_team': base['away'],
