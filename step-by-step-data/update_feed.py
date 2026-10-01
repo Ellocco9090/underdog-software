@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -1192,6 +1193,7 @@ def stats_support_for_record(record: dict) -> float:
 def quality_tier_for_record(record: dict) -> int:
     support=int(record.get('_externalSupportCount') or 0)
     oppose=int(record.get('_externalOpposeCount') or 0)
+    validated90=int(record.get('_validated90SupportCount') or 0)
     stats=float(record.get('_statsSupport') or 0)
     providers=int(record.get('_providerCount') or 0)
     spread=float(record.get('_marketSpreadPct') or 9)
@@ -1206,6 +1208,11 @@ def quality_tier_for_record(record: dict) -> int:
         return 0
     if oppose > support and oppose > 0:
         return 0
+
+    # V9 PRIMARY: almeno una fonte con track record pubblico >=90%
+    # sullo STESSO tipo di mercato + mercato bookmaker stabile.
+    if validated90>=1 and providers>=5 and spread<=.18 and deviation<=.10:
+        return 4
 
     # A: consenso esterno forte.
     if support >= 2 and oppose == 0:
@@ -1347,6 +1354,280 @@ def verify_records_on_odd24_betflag(records, day: str, now: datetime):
     return verified
 
 
+
+
+VALIDATED_90_SOURCES_V9 = {
+    'matris_dc_85': {
+        'market':'Doppia chance',
+        'threshold':85.0,
+        'historical_win_rate':90.7,
+        'sample':7108,
+    },
+    'footballprediction_ai_over15': {
+        'market':'Over 1.5',
+        'historical_win_rate':90.6,
+        'sample':286,
+    },
+}
+
+def absolute_url(base: str, href: str):
+    try:
+        return urljoin(base,href)
+    except Exception:
+        return href
+
+def aliases_present_in_text(team: str, text: str) -> bool:
+    t=source_plain(text)
+    for alias in source_team_aliases(team):
+        if alias and alias in t:
+            return True
+    return False
+
+def matris_dc_values_from_html(html_text: str):
+    soup=BeautifulSoup(html_text,'html.parser')
+    text=clean(soup.get_text(' ',strip=True))
+    values={}
+
+    patterns=[
+        re.compile(r'\b(1X|X1|12|X2|2X)\b.{0,180}?(\d{2,3}(?:[.,]\d+)?)\s*%',re.I),
+        re.compile(r'(\d{2,3}(?:[.,]\d+)?)\s*%\s*\(\s*(1X|X1|12|X2|2X)\b',re.I),
+    ]
+
+    for pat in patterns:
+        for m in pat.finditer(text):
+            if pat.pattern.startswith(r'\b('):
+                sign=m.group(1).upper()
+                pct=m.group(2)
+            else:
+                pct=m.group(1)
+                sign=m.group(2).upper()
+
+            if sign=='X1': sign='1X'
+            if sign=='2X': sign='X2'
+
+            try:
+                value=float(pct.replace(',','.'))
+            except Exception:
+                continue
+
+            if 0 < value <= 100:
+                values[sign]=max(value,values.get(sign,0))
+
+    return values
+
+def load_matris_high_confidence_dc_v9(records):
+    candidates=[
+        r for r in records
+        if r.get('market_name')=='Doppia chance' and
+        r.get('selection_column') in {'1X','12','X2'}
+    ]
+    if not candidates:
+        return {}
+
+    headers={
+        'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+        'Accept':'text/html,*/*',
+    }
+    session=requests.Session()
+    session.headers.update(headers)
+
+    seeds=[
+        'https://matrisx.com/en',
+        'https://matrisx.com/en/track-record',
+    ]
+
+    league_urls=set()
+    match_index=[]
+
+    for seed in seeds:
+        try:
+            response=session.get(seed,timeout=16)
+            response.raise_for_status()
+            soup=BeautifulSoup(response.text,'html.parser')
+            for a in soup.select('a[href]'):
+                href=str(a.get('href') or '')
+                if '/en/leagues/' in href:
+                    league_urls.add(absolute_url(seed,href))
+                if '/en/match/' in href:
+                    label=clean(
+                        a.get_text(' ',strip=True) or
+                        (a.parent.get_text(' ',strip=True) if a.parent else '')
+                    )
+                    match_index.append((absolute_url(seed,href),label))
+        except Exception as exc:
+            print(f'WARN Matris seed {seed}: {exc}',file=sys.stderr)
+
+    def fetch_league(url):
+        response=session.get(url,timeout=16)
+        response.raise_for_status()
+        soup=BeautifulSoup(response.text,'html.parser')
+        rows=[]
+        for a in soup.select('a[href]'):
+            href=str(a.get('href') or '')
+            if '/en/match/' not in href:
+                continue
+            parent_text=(
+                a.parent.get_text(' ',strip=True)
+                if a.parent else ''
+            )
+            label=clean(a.get_text(' ',strip=True)+' '+parent_text)
+            rows.append((absolute_url(url,href),label))
+        return rows
+
+    league_urls=list(league_urls)[:40]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        jobs={pool.submit(fetch_league,url):url for url in league_urls}
+        for future in as_completed(jobs):
+            try:
+                match_index.extend(future.result())
+            except Exception as exc:
+                print(
+                    f'WARN Matris league {jobs[future]}: {exc}',
+                    file=sys.stderr
+                )
+
+    # URL unici mantenendo il testo più ricco.
+    unique_links={}
+    for url,label in match_index:
+        if not url:
+            continue
+        if len(label)>len(unique_links.get(url,'')):
+            unique_links[url]=label
+
+    event_to_url={}
+    for r in candidates:
+        for url,label in unique_links.items():
+            if (
+                aliases_present_in_text(r.get('home_team',''),label) and
+                aliases_present_in_text(r.get('away_team',''),label)
+            ):
+                event_to_url[r['event_id']]=url
+                break
+
+    urls=sorted(set(event_to_url.values()))
+    page_values={}
+
+    def fetch_match(url):
+        response=session.get(url,timeout=16)
+        response.raise_for_status()
+        return url,matris_dc_values_from_html(response.text)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        jobs={pool.submit(fetch_match,url):url for url in urls}
+        for future in as_completed(jobs):
+            url=jobs[future]
+            try:
+                key,values=future.result()
+                page_values[key]=values
+            except Exception as exc:
+                print(f'WARN Matris match {url}: {exc}',file=sys.stderr)
+
+    support={}
+    for r in candidates:
+        url=event_to_url.get(r['event_id'])
+        if not url:
+            continue
+        sign=str(r.get('selection_column') or '')
+        pct=float((page_values.get(url) or {}).get(sign) or 0)
+        if pct>=85.0:
+            support[(r['event_id'],r['market_name'],sign)]={
+                'source':'matris_dc_85',
+                'probability':round(pct,1),
+                'historical_win_rate':90.7,
+                'sample':7108,
+            }
+
+    print(
+        f'VALIDATED90 Matris: {len(support)} selezioni DC>=85%'
+    )
+    return support
+
+def load_footballprediction_ai_over15_v9(records):
+    candidates=[
+        r for r in records
+        if r.get('market_name')=='Over/Under' and
+        r.get('selection_column')=='Over 1.5'
+    ]
+    if not candidates:
+        return {}
+
+    url='https://www.footballprediction.ai/'
+    try:
+        response=requests.get(
+            url,
+            timeout=18,
+            headers={
+                'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+                'Accept':'text/html,*/*',
+            }
+        )
+        response.raise_for_status()
+        soup=BeautifulSoup(response.text,'html.parser')
+        text=source_plain(soup.get_text(' ',strip=True))
+    except Exception as exc:
+        print(f'WARN FootballPredictionAI: {exc}',file=sys.stderr)
+        return {}
+
+    support={}
+    for r in candidates:
+        chunk=source_find_nearest_pair(
+            text,
+            r.get('home_team',''),
+            r.get('away_team','')
+        )
+        if not chunk:
+            continue
+
+        # Il track record 90.6% riguarda le pick pubblicate di tipo Over 1.5.
+        # Non basta che la card contenga il mercato: deve essere la scelta AI.
+        m=re.search(
+            r'ai s choice\s+(.{0,55})',
+            chunk,
+            re.I
+        )
+        if not m:
+            continue
+
+        choice=m.group(1)
+        if not re.search(r'\bover\s*1[.,]5\b|\bover\s*1\.5\b',choice,re.I):
+            continue
+
+        support[(r['event_id'],r['market_name'],r['selection_column'])]={
+            'source':'footballprediction_ai_over15',
+            'historical_win_rate':90.6,
+            'sample':286,
+        }
+
+    print(
+        f'VALIDATED90 FootballPredictionAI: {len(support)} selezioni Over1.5'
+    )
+    return support
+
+def enrich_records_with_validated90_v9(records, day: str):
+    # Queste sono le sole fonti che possono ABILITARE una giocata V9.
+    # Le vecchie fonti restano solo controlli secondari/tie-breaker.
+    matris=load_matris_high_confidence_dc_v9(records)
+    fpai=load_footballprediction_ai_over15_v9(records)
+
+    for r in records:
+        key=(r['event_id'],r['market_name'],r['selection_column'])
+        hits=[]
+        if key in matris:
+            hits.append(matris[key])
+        if key in fpai:
+            hits.append(fpai[key])
+
+        r['_validated90SupportCount']=len(hits)
+        r['_validated90Sources']=[h['source'] for h in hits]
+        r['_validated90Details']=hits
+        r['_validated90BestHistoricalRate']=round(
+            max([h['historical_win_rate'] for h in hits],default=0),
+            1
+        )
+
+    total=sum(1 for r in records if int(r.get('_validated90SupportCount') or 0)>0)
+    print(f'VALIDATED90 TOTAL {day}: {total} selezioni abilitate')
+    return records
 
 def source_plain(value: str) -> str:
     value=unicodedata.normalize('NFKD',str(value or '')).encode('ascii','ignore').decode('ascii').lower()
@@ -1700,6 +1981,8 @@ def board_record_score(record: dict) -> float:
     net=float(record.get('_externalNet') or 0)
     tier=int(record.get('_externalTier') or 0)
     quality=int(record.get('_qualityTier') or 0)
+    validated90=int(record.get('_validated90SupportCount') or 0)
+    validated_rate=float(record.get('_validated90BestHistoricalRate') or 0)
     stats_support=float(record.get('_statsSupport') or 0)
     providers=int(record.get('_providerCount') or 0)
     spread=float(record.get('_marketSpreadPct') or 9)
@@ -1710,6 +1993,8 @@ def board_record_score(record: dict) -> float:
         board_market_bonus(record) -
         max(0,odd-1.35)*11 +
         quality*16 +
+        validated90*24 +
+        max(0,validated_rate-90)*3 +
         stats_support*12 +
         min(providers,10)*.75 -
         max(0,spread-.08)*35
@@ -1767,10 +2052,13 @@ def build_canonical_board(records, day: str, now: datetime):
         oppose=int(r.get('_externalOpposeCount') or 0)
         covered=int(r.get('_externalCovered') or 0)
         quality=int(r.get('_qualityTier') or 0)
+        validated90=int(r.get('_validated90SupportCount') or 0)
 
-        # V8: niente fallback debole. La selezione entra solo se supera
-        # un Quality Tier almeno 3 (consenso/statistiche/mercato stabili).
-        if quality<3:
+        # V9: una giocata entra SOLO se una fonte con storico pubblico >=90%
+        # la supporta sullo stesso mercato. Gli altri siti non possono abilitarla.
+        if validated90<1:
+            continue
+        if quality<4:
             continue
         if covered>0 and oppose>support:
             continue
@@ -1901,6 +2189,10 @@ def build_canonical_board(records, day: str, now: datetime):
                 '_marketMedianOdd':r.get('_marketMedianOdd'),
                 '_marketSpreadPct':r.get('_marketSpreadPct'),
                 '_betflagDeviationPct':r.get('_betflagDeviationPct'),
+                '_validated90SupportCount':int(r.get('_validated90SupportCount') or 0),
+                '_validated90Sources':r.get('_validated90Sources') or [],
+                '_validated90Details':r.get('_validated90Details') or [],
+                '_validated90BestHistoricalRate':float(r.get('_validated90BestHistoricalRate') or 0),
             })
         roads.append({
             'road':road,
@@ -1909,14 +2201,14 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':8,
+        'version':9,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
         'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
-        'selection_engine':'strict-quality-exact-150-v8',
-        'quality_policy':'tier3plus_exact_150_no_forced_fill',
+        'selection_engine':'validated90-exact150-v9',
+        'quality_policy':'validated90_primary_quality4_exact150',
         'roads':roads,
     }
 
@@ -1940,10 +2232,10 @@ def build_day(day: str, make_latest: bool):
     if (
         board is not None and
         day > now.date().isoformat() and
-        int(board.get('version') or 0) < 8
+        int(board.get('version') or 0) < 9
     ):
         print(
-            f'REBUILD FUTURE {day}: v{board.get("version")} -> V8',
+            f'REBUILD FUTURE {day}: v{board.get("version")} -> V9',
             file=sys.stderr
         )
         board=None
@@ -1956,13 +2248,14 @@ def build_day(day: str, make_latest: bool):
     else:
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
+        verified=enrich_records_with_validated90_v9(verified,day)
         verified=enrich_records_with_multi_source_v6(verified,pages)
         board=build_canonical_board(verified,day,now)
 
         if board is None:
             print(
-                f'WARN {day}: non ci sono 10 selezioni Tier>=3, Betflag '
-                'verificate e combinabili esattamente a quota 1.50',
+                f'WARN {day}: non ci sono 10 selezioni con fonte >=90% verificata, '
+                'Quality 4, Betflag e combinazione esatta quota 1.50',
                 file=sys.stderr
             )
 
