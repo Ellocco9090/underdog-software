@@ -1753,6 +1753,15 @@ def build_day(day: str, make_latest: bool):
             f'BOARD FREEZE {day}: v{board.get("version")} '
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
+
+        # DIAGNOSTICA V6 UNA-TANTUM: verifica che le fonti esterne
+        # siano raggiungibili senza toccare la board già congelata.
+        if make_latest:
+            _diag_pages=load_multi_source_pages_v6()
+            print(
+                'MULTI SOURCE DIAG: '+
+                ','.join(sorted(p['id'] for p in _diag_pages))
+            )
     else:
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
