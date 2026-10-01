@@ -2086,7 +2086,7 @@ def load_existing_board(day: str):
             len(roads)==5 and
             all(len(r.get('selections',[]))==2 for r in roads) and
             (
-                version>=10
+                version>=11
                 if day>='2026-10-02'
                 else version>=5
             ) and
@@ -2208,67 +2208,29 @@ def build_canonical_board(records, day: str, now: datetime):
         quality=int(r.get('_qualityTier') or 0)
         validated90=int(r.get('_validated90SupportCount') or 0)
 
-        # V10: le fonti con track record pubblico >=90% hanno PRIORITÀ MASSIMA.
-        # Se per una specifica partita non esiste oggi una copertura 90% pubblica,
-        # la giocata può entrare solo tramite il quality gate forte:
-        # consenso esterno reale oppure statistiche molto forti + mercato stabile.
+        # V11 STRICT: ogni singola selezione deve essere coperta
+        # da almeno una fonte con track record pubblico >=90% nello
+        # stesso mercato/fascia. Nessun fallback basato solo sulla quota.
         if covered>0 and oppose>support:
             continue
 
-        if validated90>=1:
-            if quality<4:
-                continue
-        else:
-            stats_support=float(r.get('_statsSupport') or 0)
-            providers=int(r.get('_providerCount') or 0)
-            spread=float(r.get('_marketSpreadPct') or 9)
-            deviation=float(r.get('_betflagDeviationPct') or 9)
+        if validated90 < 1:
+            continue
 
-            strong_consensus=(support>=2 and oppose==0)
-            mixed_strong=(
-                support>=1 and oppose==0 and
-                stats_support>=.60 and
-                providers>=6 and
-                spread<=.18 and
-                deviation<=.10
-            )
-            stats_market=(
-                stats_support>=.72 and
-                providers>=8 and
-                spread<=.14 and
-                deviation<=.08
-            )
+        # Anche con fonte >=90%, il mercato deve essere realmente
+        # disponibile su Betflag e non presentare una forte anomalia
+        # rispetto agli altri operatori.
+        providers=int(r.get('_providerCount') or 0)
+        spread=float(r.get('_marketSpreadPct') or 9)
+        deviation=float(r.get('_betflagDeviationPct') or 9)
 
-            # Fallback V10 "ULTRA-TIGHT MARKET":
-            # usato solo quando nessuna fonte >=90% copre quella partita.
-            # Non basta la quota bassa: servono tanti operatori, mercato molto
-            # compatto, Betflag vicino alla mediana e un mercato prudente.
-            market=str(r.get('market_name') or '')
-            outcome=str(r.get('selection_column') or '')
-            median_odd=float(r.get('_marketMedianOdd') or 99)
-            conf=float(r.get('_marketConfidence') or 0)
-            prudent_market=(
-                (market=='Doppia chance' and outcome in {'1X','X2'}) or
-                (market=='Over/Under' and outcome=='Over 1.5')
-            )
-            ultra_tight_market=(
-                prudent_market and
-                providers>=10 and
-                spread<=.08 and
-                deviation<=.05 and
-                median_odd<=1.40 and
-                conf>=.80
-            )
+        if providers < 5 or spread > .18 or deviation > .10:
+            continue
 
-            if not (
-                (quality>=3 and (strong_consensus or mixed_strong or stats_market))
-                or ultra_tight_market
-            ):
-                continue
-
-            if ultra_tight_market and quality<3:
-                r['_qualityTier']=2
-                r['_approvalPathOverride']='ultra-tight-market'
+        # quality_tier_for_record assegna Tier 4 ai validated90
+        # solo se il controllo bookmaker è coerente.
+        if quality < 4:
+            continue
 
         future.append(r)
 
@@ -2285,7 +2247,7 @@ def build_canonical_board(records, day: str, now: datetime):
         approval_counts[_ap]=approval_counts.get(_ap,0)+1
 
     print(
-        f'V10 CANDIDATES {day}: {len(future)} '
+        f'V11 STRICT CANDIDATES {day}: {len(future)} '
         f'quality={quality_counts} approval={approval_counts}'
     )
 
@@ -2360,7 +2322,7 @@ def build_canonical_board(records, day: str, now: datetime):
 
             pairs.append({'a':a,'b':b,'total':total,'score':score})
 
-    print(f'V10 EXACT150 PAIRS {day}: {len(pairs)}')
+    print(f'V11 EXACT150 PAIRS {day}: {len(pairs)}')
 
     pairs.sort(key=lambda p:(
         -p['score'],
@@ -2468,14 +2430,14 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':10,
+        'version':11,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
         'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
-        'selection_engine':'priority90-qualitygate-exact150-v10',
-        'quality_policy':'validated90_priority_or_strong_qualitygate_exact150',
+        'selection_engine':'strict-validated90-exact150-v11',
+        'quality_policy':'every_leg_validated90_and_exact150',
         'roads':roads,
     }
 
@@ -2493,17 +2455,17 @@ def build_day(day: str, make_latest: bool):
     now=datetime.now(ROME)
     board=load_existing_board(day)
 
-    # MIGRAZIONE UNA-TANTUM V9: dal 02/10/2026 in poi una board
-    # costruita col vecchio motore viene rigenerata UNA SOLA VOLTA.
-    # Appena nasce una V9 valida torna immediatamente ad essere congelata
-    # e identica per tutti per l'intera giornata.
+    # MIGRAZIONE UNA-TANTUM V11: dal 02/10/2026 in poi una board
+    # costruita con fallback non-90% viene rigenerata una sola volta.
+    # La prima board V11 completa viene poi congelata e resta identica
+    # per tutti per l'intera giornata.
     if (
         board is not None and
         day >= '2026-10-02' and
-        int(board.get('version') or 0) < 10
+        int(board.get('version') or 0) < 11
     ):
         print(
-            f'REBUILD TO V10 {day}: v{board.get("version")} -> V10',
+            f'REBUILD TO V11 {day}: v{board.get("version")} -> V10',
             file=sys.stderr
         )
         board=None
@@ -2513,9 +2475,6 @@ def build_day(day: str, make_latest: bool):
             f'BOARD FREEZE {day}: v{board.get("version")} '
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
-        if make_latest and int(board.get('version') or 0)==10:
-            _ganhar_diag=load_ganhar_dc90_v11(records,day)
-            print(f'GANHAR V11 DIAG {day}: {len(_ganhar_diag)} hit')
     else:
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
@@ -2525,8 +2484,8 @@ def build_day(day: str, make_latest: bool):
 
         if board is None:
             print(
-                f'WARN {day}: non ci sono 10 selezioni che superano '
-                'quality gate forte + Betflag + combinazione esatta quota 1.50',
+                f'WARN {day}: non ci sono 10 selezioni con fonte >=90% '
+                'verificata + Betflag + combinazione esatta quota 1.50',
                 file=sys.stderr
             )
 
