@@ -1512,6 +1512,54 @@ def matris_page_payload_v12(html_text: str):
         'dc':dc,
     }
 
+def probe_todaybettingtips_v12(day: str):
+    url=f'https://www.todaybettingtips.com/?date={day}&tab=predictions'
+    try:
+        response=requests.get(
+            url,
+            timeout=18,
+            headers={
+                'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+                'Accept':'text/html,*/*',
+            }
+        )
+        response.raise_for_status()
+        html=response.text
+        soup=BeautifulSoup(html,'html.parser')
+        text=clean(soup.get_text(' ',strip=True))
+        marker=text.lower().find('double chance')
+        snippet=text[max(0,marker-1200):marker+5000] if marker>=0 else text[:5000]
+        print(
+            f'TODAYBETTINGTIPS PROBE {day}: status={response.status_code} '
+            f'html={len(html)} text={len(text)} snippet='+
+            snippet,
+            file=sys.stderr
+        )
+
+        # Logga i primi elementi che contengono una percentuale alta,
+        # così individuiamo la struttura DOM senza alterare la board.
+        hits=[]
+        for node in soup.find_all(['div','article','li','tr','section']):
+            t=clean(node.get_text(' ',strip=True))
+            if (
+                len(t)>=20 and len(t)<=1200 and
+                re.search(r'\b9[0-9](?:[.,]\d+)?\s*%',t) and
+                ('Double Chance' in t or 'Over 1.5' in t)
+            ):
+                hits.append({
+                    'name':node.name,
+                    'class':' '.join(node.get('class') or []),
+                    'text':t[:900],
+                })
+                if len(hits)>=8:
+                    break
+        print(
+            'TODAYBETTINGTIPS DOM '+json.dumps(hits,ensure_ascii=False),
+            file=sys.stderr
+        )
+    except Exception as exc:
+        print(f'WARN TodayBettingTips probe {day}: {exc}',file=sys.stderr)
+
 def load_matris_high_confidence_dc_v12(records, day: str):
     candidates=[
         r for r in records
@@ -2609,6 +2657,8 @@ def build_day(day: str, make_latest: bool):
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
     else:
+        if day == datetime.now(ROME).date().isoformat():
+            probe_todaybettingtips_v12(day)
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
         verified=enrich_records_with_validated90_v9(verified,day)
