@@ -34,6 +34,40 @@ BETFLAG_HEADERS = {
     'Accept':'application/json,text/plain,*/*',
 }
 
+
+MULTI_SOURCE_BOARD_V6 = [
+    {
+        'id':'predictz',
+        'weight':1.00,
+        'kind':'predictz',
+        'url':'https://r.jina.ai/http://www.predictz.com/predictions/',
+    },
+    {
+        'id':'windrawwin',
+        'weight':0.96,
+        'kind':'windrawwin',
+        'url':'https://r.jina.ai/http://www.windrawwin.com/',
+    },
+    {
+        'id':'forebet',
+        'weight':1.02,
+        'kind':'forebet',
+        'url':'https://r.jina.ai/http://www.forebet.com/en',
+    },
+    {
+        'id':'forebetdc',
+        'weight':1.04,
+        'kind':'forebetdc',
+        'url':'https://r.jina.ai/http://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
+    },
+    {
+        'id':'vitibet',
+        'weight':0.98,
+        'kind':'vitibet',
+        'url':'https://r.jina.ai/http://www.vitibet.com/index.php?clanek=quicktips&lang=en&sekce=fotbal',
+    },
+]
+
 def clean(s: str) -> str:
     return re.sub(r'\s+', ' ', str(s or '').replace('\xa0',' ')).strip()
 
@@ -1159,20 +1193,310 @@ def verify_records_on_odd24_betflag(records, day: str, now: datetime):
     return verified
 
 
+
+def source_plain(value: str) -> str:
+    value=unicodedata.normalize('NFKD',str(value or '')).encode('ascii','ignore').decode('ascii').lower()
+    value=value.replace('&',' and ')
+    value=re.sub(r'[^a-z0-9.+/-]+',' ',value)
+    return re.sub(r'\s+',' ',value).strip()
+
+def source_team_aliases(value: str):
+    original=source_plain(value)
+    original=re.sub(
+        r'\b(football club|futbol club|soccer club|club de futbol|fc|cf|sc|ac|afc)\b',
+        ' ',
+        original
+    )
+    original=re.sub(r'\s+',' ',original).strip()
+
+    aliases=set()
+    if original:
+        aliases.add(original)
+
+    replacements=[
+        ('manchester united','man utd'),
+        ('manchester city','man city'),
+        ('tottenham hotspur','tottenham'),
+        ('wolverhampton wanderers','wolves'),
+        ('nottingham forest','nott m forest'),
+        ('newcastle united','newcastle'),
+        ('west ham united','west ham'),
+        ('brighton and hove albion','brighton'),
+    ]
+
+    for old,new in replacements:
+        changed=original.replace(old,new).strip()
+        if changed:
+            aliases.add(changed)
+
+    tokens=[x for x in original.split() if x]
+    if len(tokens)>=2:
+        aliases.add(' '.join(tokens[:2]))
+        aliases.add(' '.join(tokens[-2:]))
+
+    return [x for x in aliases if len(x)>=5]
+
+def source_find_nearest_pair(text: str, home: str, away: str):
+    h_aliases=source_team_aliases(home)
+    a_aliases=source_team_aliases(away)
+    best=None
+
+    for h in h_aliases:
+        hp=text.find(h)
+        while hp>=0:
+            for a in a_aliases:
+                start=max(0,hp-900)
+                end=min(len(text),hp+1600)
+                ap=text.find(a,start,end)
+                if ap>=0:
+                    distance=abs(ap-hp)
+                    if best is None or distance<best[0]:
+                        best=(distance,hp,ap)
+            hp=text.find(h,hp+len(h))
+
+    if best is None:
+        return None
+
+    _,hp,ap=best
+    left=max(0,min(hp,ap)-700)
+    right=min(len(text),max(hp,ap)+1100)
+    return text[left:right]
+
+def source_signals(kind: str, chunk: str):
+    s=source_plain(chunk)
+    out=set()
+
+    if re.search(r'\b(home win|home victory|prediction home|pronostico vittoria casa)\b',s):
+        out.add('H')
+    if re.search(r'\b(away win|away victory|prediction away|pronostico vittoria trasferta)\b',s):
+        out.add('A')
+    if re.search(r'\b(prediction draw|draw prediction|pareggio)\b',s):
+        out.add('D')
+
+    if kind=='predictz':
+        if re.search(r'\bhome\s+\d+[-:]\d+\b',s): out.add('H')
+        if re.search(r'\baway\s+\d+[-:]\d+\b',s): out.add('A')
+        if re.search(r'\b(draw|tie)\s+\d+[-:]\d+\b',s): out.add('D')
+
+    if kind=='forebetdc':
+        if re.search(r'\b(?:1x|x1)\b',s): out.add('DC1X')
+        if re.search(r'\bx2\b',s): out.add('DCX2')
+        if re.search(r'\b12\b',s): out.add('DC12')
+
+    if re.search(r'\b(?:tip|tips|prediction|pick|best pick)\s*[:\-]?\s*(?:home|\(?1\)?)\b',s):
+        out.add('H')
+    if re.search(r'\b(?:tip|tips|prediction|pick|best pick)\s*[:\-]?\s*(?:away|\(?2\)?)\b',s):
+        out.add('A')
+    if re.search(r'\b(?:tip|tips|prediction|pick|best pick)\s*[:\-]?\s*(?:draw|x)\b',s):
+        out.add('D')
+
+    if re.search(r'\b(?:tip|tips|prediction|pick|best pick)\s*[:\-]?\s*1x\b',s):
+        out.add('DC1X')
+    if re.search(r'\b(?:tip|tips|prediction|pick|best pick)\s*[:\-]?\s*x2\b',s):
+        out.add('DCX2')
+    if re.search(r'\b(?:tip|tips|prediction|pick|best pick)\s*[:\-]?\s*12\b',s):
+        out.add('DC12')
+
+    if re.search(r'\bover\s*1[.,]5\b|\bover\s*1\.5\b',s): out.add('O15')
+    if re.search(r'\bunder\s*1[.,]5\b|\bunder\s*1\.5\b',s): out.add('U15')
+    if re.search(r'\bover\s*2[.,]5\b|\bover\s*2\.5\b',s): out.add('O25')
+    if re.search(r'\bunder\s*2[.,]5\b|\bunder\s*2\.5\b',s): out.add('U25')
+
+    if re.search(r'\b(btts|bts|both teams to score)\s*[-:]?\s*(yes|y)?\b|\bgoal goal\b|\bgg\b',s):
+        out.add('GG')
+    if re.search(r'\b(btts|both teams to score)\s*[-:]?\s*(no|n)\b|\bno goal\b|\bng\b',s):
+        out.add('NG')
+
+    return out
+
+def source_vote_for_record(signals, record: dict) -> float:
+    market=str(record.get('market_name') or '')
+    outcome=str(record.get('selection_column') or '')
+
+    if not signals:
+        return 0.0
+
+    if market=='1X2':
+        if outcome=='1':
+            if 'H' in signals: return 1.0
+            if 'A' in signals or 'D' in signals: return -1.0
+        if outcome=='2':
+            if 'A' in signals: return 1.0
+            if 'H' in signals or 'D' in signals: return -1.0
+        if outcome=='X':
+            if 'D' in signals: return 1.0
+            if 'H' in signals or 'A' in signals: return -1.0
+
+    if market=='Doppia chance':
+        if outcome=='1X':
+            if 'DC1X' in signals: return 1.15
+            if 'H' in signals or 'D' in signals: return .75
+            if 'A' in signals or 'DCX2' in signals: return -1.0
+        if outcome=='X2':
+            if 'DCX2' in signals: return 1.15
+            if 'A' in signals or 'D' in signals: return .75
+            if 'H' in signals or 'DC1X' in signals: return -1.0
+        if outcome=='12':
+            if 'DC12' in signals: return 1.10
+            if 'H' in signals or 'A' in signals: return .55
+            if 'D' in signals: return -1.0
+
+    if market=='Over/Under':
+        if outcome=='Over 1.5':
+            if 'O15' in signals: return 1.0
+            if 'U15' in signals: return -1.0
+            if 'O25' in signals: return .60
+        if outcome=='Over 2.5':
+            if 'O25' in signals: return 1.0
+            if 'U25' in signals: return -1.0
+        if outcome=='Under 2.5':
+            if 'U25' in signals: return 1.0
+            if 'O25' in signals: return -1.0
+
+    if market=='Gol/No Gol':
+        if outcome=='GG':
+            if 'GG' in signals: return 1.0
+            if 'NG' in signals: return -1.0
+        if outcome=='NG':
+            if 'NG' in signals: return 1.0
+            if 'GG' in signals: return -1.0
+
+    return 0.0
+
+def load_multi_source_pages_v6():
+    headers={
+        'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+        'Accept':'text/plain,text/html,*/*',
+    }
+
+    def one(source):
+        response=requests.get(source['url'],headers=headers,timeout=18)
+        response.raise_for_status()
+        text=source_plain(response.text)
+        if len(text)<300:
+            raise RuntimeError('pagina troppo corta')
+        return {
+            'id':source['id'],
+            'kind':source['kind'],
+            'weight':float(source['weight']),
+            'text':text,
+        }
+
+    pages=[]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        jobs={pool.submit(one,src):src for src in MULTI_SOURCE_BOARD_V6}
+        for future in as_completed(jobs):
+            src=jobs[future]
+            try:
+                pages.append(future.result())
+            except Exception as exc:
+                print(
+                    f'WARN fonte {src["id"]}: {exc}',
+                    file=sys.stderr
+                )
+
+    print(
+        'MULTI SOURCE V6: '+
+        str(len(pages))+'/'+str(len(MULTI_SOURCE_BOARD_V6))+
+        ' fonti disponibili'
+    )
+    return pages
+
+def enrich_records_with_multi_source_v6(records, pages):
+    if not pages:
+        for r in records:
+            r['_externalSupportCount']=0
+            r['_externalOpposeCount']=0
+            r['_externalCovered']=0
+            r['_externalNet']=0.0
+            r['_externalTier']=0
+        return records
+
+    cache={}
+
+    for r in records:
+        fixture_key=(
+            canonical_team_key(r.get('home_team','')),
+            canonical_team_key(r.get('away_team',''))
+        )
+
+        if fixture_key not in cache:
+            cache[fixture_key]={}
+            for page in pages:
+                chunk=source_find_nearest_pair(
+                    page['text'],
+                    r.get('home_team',''),
+                    r.get('away_team','')
+                )
+                cache[fixture_key][page['id']]=(
+                    source_signals(page['kind'],chunk)
+                    if chunk else set()
+                )
+
+        support_count=0
+        oppose_count=0
+        covered=0
+        weighted_support=0.0
+        weighted_oppose=0.0
+        support_sources=[]
+
+        for page in pages:
+            signals=cache[fixture_key].get(page['id']) or set()
+            vote=source_vote_for_record(signals,r)
+            if vote==0:
+                continue
+
+            covered+=1
+            weight=float(page['weight'])
+
+            if vote>0:
+                support_count+=1
+                weighted_support+=weight*vote
+                support_sources.append(page['id'])
+            else:
+                oppose_count+=1
+                weighted_oppose+=weight*abs(vote)
+
+        net=weighted_support-weighted_oppose
+
+        if support_count>=3 and oppose_count==0:
+            tier=4
+        elif support_count>=2 and oppose_count==0:
+            tier=3
+        elif support_count>=1 and oppose_count==0:
+            tier=2
+        elif support_count>oppose_count and net>0:
+            tier=1
+        else:
+            tier=0
+
+        r['_externalSupportCount']=support_count
+        r['_externalOpposeCount']=oppose_count
+        r['_externalCovered']=covered
+        r['_externalWeightedSupport']=round(weighted_support,3)
+        r['_externalWeightedOppose']=round(weighted_oppose,3)
+        r['_externalNet']=round(net,3)
+        r['_externalTier']=tier
+        r['_externalSupportSources']=support_sources
+
+    return records
+
 def load_existing_board(day: str):
-    path = OUT_DIR / f'{day}.json'
+    path=OUT_DIR / f'{day}.json'
     if not path.exists():
         return None
+
     try:
         payload=json.loads(path.read_text(encoding='utf-8'))
         board=payload.get('board')
         roads=board.get('roads') if isinstance(board,dict) else None
+        version=int(board.get('version') or 0) if isinstance(board,dict) else 0
 
         if (
             isinstance(roads,list) and
             len(roads)==5 and
             all(len(r.get('selections',[]))==2 for r in roads) and
-            int(board.get('version') or 0)>=5 and
+            version>=5 and
             board.get('playability_source')=='odd24-modal-betflag-v1' and
             all(
                 all(
@@ -1183,9 +1507,12 @@ def load_existing_board(day: str):
                 for road in roads
             )
         ):
+            # BOARD FREEZE: una volta pubblicata per quel giorno non viene
+            # rigenerata né cambiata. Questo vale anche per le board V5 già attive.
             return board
     except Exception:
         return None
+
     return None
 
 
@@ -1200,11 +1527,41 @@ def board_market_bonus(record: dict) -> float:
     return 0.0
 
 def board_record_score(record: dict) -> float:
-    odd = float(record.get('odd') or 0)
-    conf = float(record.get('_marketConfidence') or .5)
-    if odd <= 1:
+    odd=float(record.get('odd') or 0)
+    conf=float(record.get('_marketConfidence') or .5)
+
+    if odd<=1:
         return -999
-    return conf*55 + (1/odd)*35 + board_market_bonus(record) - max(0,odd-1.35)*12
+
+    support=int(record.get('_externalSupportCount') or 0)
+    oppose=int(record.get('_externalOpposeCount') or 0)
+    covered=int(record.get('_externalCovered') or 0)
+    net=float(record.get('_externalNet') or 0)
+    tier=int(record.get('_externalTier') or 0)
+
+    base=(
+        conf*50 +
+        (1/odd)*34 +
+        board_market_bonus(record) -
+        max(0,odd-1.35)*11
+    )
+
+    consensus=(
+        support*7.5 -
+        oppose*11.0 +
+        min(covered,4)*1.1 +
+        max(-2.5,min(3.5,net))*2.3
+    )
+
+    tier_bonus={
+        4:18.0,
+        3:12.0,
+        2:6.5,
+        1:2.5,
+        0:0.0,
+    }.get(tier,0.0)
+
+    return base+consensus+tier_bonus
 
 def build_canonical_board(records, day: str, now: datetime):
     # Qui arrivano SOLO selezioni confermate nel market-modal Odd24
@@ -1236,6 +1593,17 @@ def build_canonical_board(records, day: str, now: datetime):
             continue
         if r.get('selection_column') in ('X','Under 1.5'):
             continue
+
+        support=int(r.get('_externalSupportCount') or 0)
+        oppose=int(r.get('_externalOpposeCount') or 0)
+        covered=int(r.get('_externalCovered') or 0)
+
+        # Se le fonti trovate sono nettamente contrarie, la selezione
+        # non entra nella board. Una mancata copertura invece non viene
+        # confusa con un parere negativo.
+        if covered>0 and oppose>support:
+            continue
+
         future.append(r)
 
     future.sort(key=lambda r:(
@@ -1282,7 +1650,22 @@ def build_canonical_board(records, day: str, now: datetime):
                 a['record'].get('country') == b['record'].get('country') and
                 a['record'].get('league_name') == b['record'].get('league_name')
             )
-            score=a['score']+b['score']-abs(total-1.50)*45-(1.2 if same_league else 0)
+            tier_a=int(a['record'].get('_externalTier') or 0)
+            tier_b=int(b['record'].get('_externalTier') or 0)
+            both_supported=(
+                int(a['record'].get('_externalSupportCount') or 0)>0 and
+                int(b['record'].get('_externalSupportCount') or 0)>0
+            )
+
+            score=(
+                a['score']+
+                b['score']-
+                abs(total-1.50)*45-
+                (1.5 if same_league else 0)+
+                min(tier_a,tier_b)*2.0+
+                (4.0 if both_supported else 0.0)
+            )
+
             pairs.append({'a':a,'b':b,'total':total,'score':score})
 
     pairs.sort(key=lambda p:(
@@ -1327,6 +1710,11 @@ def build_canonical_board(records, day: str, now: datetime):
                 '_betflagOdd':r.get('_betflagOdd'),
                 '_betflagCheckedAt':r.get('_betflagCheckedAt'),
                 '_playabilitySource':'odd24-modal-betflag-v1',
+                '_externalSupportCount':int(r.get('_externalSupportCount') or 0),
+                '_externalOpposeCount':int(r.get('_externalOpposeCount') or 0),
+                '_externalCovered':int(r.get('_externalCovered') or 0),
+                '_externalNet':float(r.get('_externalNet') or 0),
+                '_externalTier':int(r.get('_externalTier') or 0),
             })
         roads.append({
             'road':road,
@@ -1335,12 +1723,14 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':5,
+        'version':6,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
         'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
+        'selection_engine':'multi-source-consensus-v6',
+        'quality_policy':'prefer_multi_source_no_net_contradiction',
         'roads':roads,
     }
 
@@ -1358,8 +1748,15 @@ def build_day(day: str, make_latest: bool):
     now=datetime.now(ROME)
     board=load_existing_board(day)
 
-    if board is None:
+    if board is not None:
+        print(
+            f'BOARD FREEZE {day}: v{board.get("version")} '
+            f'{board.get("selection_engine","legacy-v5")} · invariata'
+        )
+    else:
+        pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
+        verified=enrich_records_with_multi_source_v6(verified,pages)
         board=build_canonical_board(verified,day,now)
 
         if board is None:
