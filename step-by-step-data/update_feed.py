@@ -1674,10 +1674,14 @@ def load_ganhar_dc90_v11(records, day: str):
 
     for sign,market in market_map.items():
         direct=f'https://www.ganhar.pt/en/predictions?date={day}&market={market}'
+        bare=f'https://ganhar.pt/en/predictions?date={day}&market={market}'
+        pt=f'https://ganhar.pt/pt/previsoes?date={day}&market={market}'
         urls=[
             direct,
-            'https://r.jina.ai/https://www.ganhar.pt/en/predictions?date='+day+'&market='+market,
-            'https://r.jina.ai/http://www.ganhar.pt/en/predictions?date='+day+'&market='+market,
+            bare,
+            pt,
+            'https://r.jina.ai/http://ganhar.pt/en/predictions?date='+day+'&market='+market,
+            'https://r.jina.ai/https://ganhar.pt/en/predictions?date='+day+'&market='+market,
         ]
         errors=[]
         for url in urls:
