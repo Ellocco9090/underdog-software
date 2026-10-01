@@ -1618,11 +1618,117 @@ def load_footballprediction_ai_over15_v9(records):
     )
     return support
 
+
+def _find_pair_after_percent(text: str, home: str, away: str):
+    text=source_plain(text)
+    h_aliases=source_team_aliases(home)
+    a_aliases=source_team_aliases(away)
+    best=None
+
+    for h in h_aliases:
+        hp=text.find(h)
+        while hp>=0:
+            for a in a_aliases:
+                ap=text.find(a,max(0,hp-80),min(len(text),hp+500))
+                if ap<0:
+                    continue
+
+                end=max(hp+len(h),ap+len(a))
+                after=text[end:end+260]
+                m=re.search(r'\b(\d{2,3}(?:\.\d+)?)\s*%',after)
+                if not m:
+                    continue
+
+                try:
+                    pct=float(m.group(1))
+                except Exception:
+                    continue
+
+                distance=abs(ap-hp)
+                candidate=(distance,pct)
+                if best is None or candidate[0]<best[0]:
+                    best=candidate
+            hp=text.find(h,hp+max(1,len(h)))
+
+    return best[1] if best else None
+
+def load_ganhar_dc90_v11(records, day: str):
+    candidates=[
+        r for r in records
+        if r.get('market_name')=='Doppia chance' and
+        r.get('selection_column') in {'1X','X2'}
+    ]
+    if not candidates:
+        return {}
+
+    pages={}
+    headers={
+        'User-Agent':'Mozilla/5.0 StepByStep/1.0',
+        'Accept':'text/html,*/*',
+    }
+
+    market_map={
+        '1X':'double_chance_1x',
+        'X2':'double_chance_x2',
+    }
+
+    for sign,market in market_map.items():
+        url=f'https://www.ganhar.pt/en/predictions?date={day}&market={market}'
+        try:
+            response=requests.get(url,headers=headers,timeout=18)
+            response.raise_for_status()
+            page=source_plain(
+                BeautifulSoup(response.text,'html.parser').get_text(' ',strip=True)
+            )
+            if len(page)<500:
+                raise RuntimeError('pagina troppo corta')
+            pages[sign]=page
+        except Exception as exc:
+            print(f'WARN Ganhar {sign}: {exc}',file=sys.stderr)
+
+    support={}
+    for r in candidates:
+        sign=str(r.get('selection_column') or '')
+        page=pages.get(sign)
+        if not page:
+            continue
+
+        pct=_find_pair_after_percent(
+            page,
+            r.get('home_team',''),
+            r.get('away_team','')
+        )
+        if pct is None or pct < 90.0:
+            continue
+
+        # Track record Ganhar.pt nella fascia di confidenza 90-100%.
+        # Per DC 1X: 95% su 391; per DC X2: 90% su 167
+        # (pagina Performance pubblica, controllata 02/10/2026).
+        if sign=='1X':
+            historical_rate=95.0
+            sample=391
+        else:
+            historical_rate=90.0
+            sample=167
+
+        support[(r['event_id'],r['market_name'],r['selection_column'])]={
+            'source':'ganhar_dc_'+sign.lower(),
+            'prediction_confidence':round(float(pct),1),
+            'historical_win_rate':historical_rate,
+            'sample':sample,
+        }
+
+    print(
+        f'VALIDATED90 Ganhar: {len(support)} selezioni DC>=90%'
+    )
+    return support
+
 def enrich_records_with_validated90_v9(records, day: str):
-    # Queste sono le sole fonti che possono ABILITARE una giocata V9.
-    # Le vecchie fonti restano solo controlli secondari/tie-breaker.
+    # Fonti con track record pubblico >=90% nella fascia/mercato usato.
+    # Le altre fonti restano controlli secondari/tie-breaker.
     matris=load_matris_high_confidence_dc_v9(records)
     fpai=load_footballprediction_ai_over15_v9(records)
+    ganhar=load_ganhar_dc90_v11(records,day)
 
     for r in records:
         key=(r['event_id'],r['market_name'],r['selection_column'])
@@ -1631,6 +1737,8 @@ def enrich_records_with_validated90_v9(records, day: str):
             hits.append(matris[key])
         if key in fpai:
             hits.append(fpai[key])
+        if key in ganhar:
+            hits.append(ganhar[key])
 
         r['_validated90SupportCount']=len(hits)
         r['_validated90Sources']=[h['source'] for h in hits]
@@ -2384,6 +2492,9 @@ def build_day(day: str, make_latest: bool):
             f'BOARD FREEZE {day}: v{board.get("version")} '
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
+        if make_latest and int(board.get('version') or 0)==10:
+            _ganhar_diag=load_ganhar_dc90_v11(records,day)
+            print(f'GANHAR V11 DIAG {day}: {len(_ganhar_diag)} hit')
     else:
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
