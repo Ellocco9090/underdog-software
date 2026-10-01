@@ -2110,10 +2110,55 @@ def build_canonical_board(records, day: str, now: datetime):
                 deviation<=.08
             )
 
-            if quality<3 or not (strong_consensus or mixed_strong or stats_market):
+            # Fallback V10 "ULTRA-TIGHT MARKET":
+            # usato solo quando nessuna fonte >=90% copre quella partita.
+            # Non basta la quota bassa: servono tanti operatori, mercato molto
+            # compatto, Betflag vicino alla mediana e un mercato prudente.
+            market=str(r.get('market_name') or '')
+            outcome=str(r.get('selection_column') or '')
+            median_odd=float(r.get('_marketMedianOdd') or 99)
+            conf=float(r.get('_marketConfidence') or 0)
+            prudent_market=(
+                (market=='Doppia chance' and outcome in {'1X','X2'}) or
+                (market=='Over/Under' and outcome=='Over 1.5')
+            )
+            ultra_tight_market=(
+                prudent_market and
+                providers>=10 and
+                spread<=.08 and
+                deviation<=.05 and
+                median_odd<=1.40 and
+                conf>=.80
+            )
+
+            if not (
+                (quality>=3 and (strong_consensus or mixed_strong or stats_market))
+                or ultra_tight_market
+            ):
                 continue
 
+            if ultra_tight_market and quality<3:
+                r['_qualityTier']=2
+                r['_approvalPathOverride']='ultra-tight-market'
+
         future.append(r)
+
+    quality_counts={}
+    approval_counts={}
+    for _r in future:
+        _q=int(_r.get('_qualityTier') or 0)
+        quality_counts[_q]=quality_counts.get(_q,0)+1
+        _ap=(
+            'validated90'
+            if int(_r.get('_validated90SupportCount') or 0)>0
+            else str(_r.get('_approvalPathOverride') or 'strong-quality-gate')
+        )
+        approval_counts[_ap]=approval_counts.get(_ap,0)+1
+
+    print(
+        f'V10 CANDIDATES {day}: {len(future)} '
+        f'quality={quality_counts} approval={approval_counts}'
+    )
 
     future.sort(key=lambda r:(
         str(r.get('event_time','')),
@@ -2185,6 +2230,8 @@ def build_canonical_board(records, day: str, now: datetime):
             )
 
             pairs.append({'a':a,'b':b,'total':total,'score':score})
+
+    print(f'V10 EXACT150 PAIRS {day}: {len(pairs)}')
 
     pairs.sort(key=lambda p:(
         -p['score'],
@@ -2279,7 +2326,10 @@ def build_canonical_board(records, day: str, now: datetime):
                 '_approvalPath':(
                     'validated90'
                     if int(r.get('_validated90SupportCount') or 0)>0
-                    else 'strong-quality-gate'
+                    else (
+                        str(r.get('_approvalPathOverride') or '')
+                        or 'strong-quality-gate'
+                    )
                 ),
             })
         roads.append({
