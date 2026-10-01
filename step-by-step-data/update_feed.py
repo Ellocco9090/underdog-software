@@ -1673,18 +1673,35 @@ def load_ganhar_dc90_v11(records, day: str):
     }
 
     for sign,market in market_map.items():
-        url=f'https://www.ganhar.pt/en/predictions?date={day}&market={market}'
-        try:
-            response=requests.get(url,headers=headers,timeout=18)
-            response.raise_for_status()
-            page=source_plain(
-                BeautifulSoup(response.text,'html.parser').get_text(' ',strip=True)
+        direct=f'https://www.ganhar.pt/en/predictions?date={day}&market={market}'
+        urls=[
+            direct,
+            'https://r.jina.ai/https://www.ganhar.pt/en/predictions?date='+day+'&market='+market,
+            'https://r.jina.ai/http://www.ganhar.pt/en/predictions?date='+day+'&market='+market,
+        ]
+        errors=[]
+        for url in urls:
+            try:
+                response=requests.get(url,headers=headers,timeout=20)
+                response.raise_for_status()
+                raw=response.text
+                if 'r.jina.ai/' in url:
+                    page=source_plain(raw)
+                else:
+                    page=source_plain(
+                        BeautifulSoup(raw,'html.parser').get_text(' ',strip=True)
+                    )
+                if len(page)<500:
+                    raise RuntimeError('pagina troppo corta')
+                pages[sign]=page
+                break
+            except Exception as exc:
+                errors.append(str(exc))
+        if sign not in pages:
+            print(
+                f'WARN Ganhar {sign}: '+' | '.join(errors),
+                file=sys.stderr
             )
-            if len(page)<500:
-                raise RuntimeError('pagina troppo corta')
-            pages[sign]=page
-        except Exception as exc:
-            print(f'WARN Ganhar {sign}: {exc}',file=sys.stderr)
 
     support={}
     for r in candidates:
