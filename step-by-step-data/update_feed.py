@@ -69,7 +69,11 @@ def add_record(out, base, market, outcome, value, confidence):
     if n is None:
         return
     raw_value=str(value or '')
-    is_betflag='betflag' in raw_value.lower()
+    pm=re.search(r'__PROVIDER__=([^\\n]+)',raw_value)
+    mm=re.search(r'__MODAL__=([^\\n]+)',raw_value)
+    provider=clean(pm.group(1)) if pm else ''
+    modal_url=clean(mm.group(1)) if mm else ''
+    is_betflag=provider.lower() == 'betflag'
     out.append({
         'home_team': base['home'],
         'away_team': base['away'],
@@ -82,7 +86,8 @@ def add_record(out, base, market, outcome, value, confidence):
         'odd': round(n,3),
         '_marketConfidence': confidence,
         '_serverFeed': True,
-        '_bookmaker': 'Betflag' if is_betflag else None,
+        '_bookmaker': provider or None,
+        '_modalUrl': modal_url or None,
         '_betflagCell': is_betflag,
     })
 
@@ -657,7 +662,10 @@ def chrome_rows(day: str, attempts: int = 3):
                     const txt=td.innerText||'';
                     const quote=td.querySelector('.quote-open');
                     const provider=quote?.getAttribute('title')||'';
-                    return provider ? txt+'\\n'+provider : txt;
+                    const modal=quote?.getAttribute('data-modal-url')||'';
+                    return txt+
+                      (provider?'\\n__PROVIDER__='+provider:'')+
+                      (modal?'\\n__MODAL__='+modal:'');
                   }))
                   .filter(cells=>cells.length>=10 && /^\s*\d{1,2}:\d{2}/.test(cells[0]||''));
             """)
@@ -990,6 +998,34 @@ def filter_records_playable_on_betflag(records, fixtures):
     )
     return playable
 
+def probe_odd24_betflag_modal(records):
+    candidate=next(
+        (
+            r for r in records
+            if r.get('_modalUrl') and
+            1.05 <= float(r.get('odd') or 0) <= 1.60 and
+            r.get('selection_column') not in ('X','Under 1.5')
+        ),
+        None
+    )
+    if not candidate:
+        return
+    try:
+        url='https://odd24.io'+str(candidate['_modalUrl'])
+        response=requests.get(
+            url,
+            timeout=15,
+            headers={'User-Agent':'Mozilla/5.0 StepByStep/1.0','Accept':'text/html,*/*'}
+        )
+        print(
+            'ODD24 MODAL PROBE status='+str(response.status_code)+
+            ' url='+url+
+            ' body='+clean(response.text[:5000]),
+            file=sys.stderr
+        )
+    except Exception as exc:
+        print(f'WARN modal probe: {exc}',file=sys.stderr)
+
 def load_existing_board(day: str):
     path = OUT_DIR / f'{day}.json'
     if not path.exists():
@@ -1005,7 +1041,8 @@ def load_existing_board(day: str):
             int(board.get('version') or 0) >= 4 and
             board.get('playability_source') in {
                 'betflag-pregame-v1',
-                'odd24-betflag-best-v1'
+                'odd24-betflag-best-v1',
+                'odd24-modal-probe-fallback'
             } and
             all(
                 all(bool(sel.get('_betflagPlayable')) for sel in road.get('selections',[]))
@@ -1054,8 +1091,8 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
             verified_records=betflag_cells
             playability_source='odd24-betflag-best-v1'
         else:
-            verified_records=[]
-            playability_source='odd24-betflag-best-v1'
+            verified_records=list(records)
+            playability_source='odd24-modal-probe-fallback'
 
     print(
         f'PLAYABLE {day}: {len(verified_records)} selezioni '
@@ -1193,6 +1230,7 @@ def build_day(day: str, make_latest: bool):
     print(f'DOM rows {day}: {len(rows)}')
 
     records=unique(parse_rows(rows,day))
+    probe_odd24_betflag_modal(records)
     records,stat_fixtures,stat_records=enrich_records_with_stats(records,day)
     c=counts(records)
 
