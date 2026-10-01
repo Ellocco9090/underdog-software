@@ -1709,6 +1709,47 @@ def load_ganhar_dc90_v11(records, day: str):
             except Exception as exc:
                 errors.append(str(exc))
         if sign not in pages:
+            # Fallback browser: Ganhar può rispondere 502 alle richieste HTTP
+            # del runner ma la pagina pubblica viene caricata normalmente
+            # dal browser. Leggiamo soltanto il testo già visibile.
+            driver=None
+            try:
+                driver=webdriver.Chrome(options=make_options())
+                driver.set_page_load_timeout(35)
+                driver.get(direct)
+
+                def body_ready(d):
+                    try:
+                        body=d.execute_script(
+                            "return document.body ? document.body.innerText : '';"
+                        ) or ''
+                        return body if len(body)>500 and '%' in body else False
+                    except Exception:
+                        return False
+
+                body=WebDriverWait(
+                    driver,
+                    25,
+                    poll_frequency=1
+                ).until(body_ready)
+
+                page=source_plain(body)
+                if len(page)>=500:
+                    pages[sign]=page
+                    print(
+                        f'GANHAR SELENIUM {sign}: pagina caricata '
+                        f'({len(page)} caratteri)'
+                    )
+            except Exception as exc:
+                errors.append('selenium: '+str(exc))
+            finally:
+                if driver is not None:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+
+        if sign not in pages:
             print(
                 f'WARN Ganhar {sign}: '+' | '.join(errors),
                 file=sys.stderr
