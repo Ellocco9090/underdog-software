@@ -69,8 +69,8 @@ def add_record(out, base, market, outcome, value, confidence):
     if n is None:
         return
     raw_value=str(value or '')
-    pm=re.search(r'__PROVIDER__=([^\\n]+)',raw_value)
-    mm=re.search(r'__MODAL__=([^\\n]+)',raw_value)
+    pm=re.search(r'__PROVIDER__=([^\n]+)',raw_value)
+    mm=re.search(r'__MODAL__=([^\n]+)',raw_value)
     provider=clean(pm.group(1)) if pm else ''
     modal_url=clean(mm.group(1)) if mm else ''
     is_betflag=provider.lower() == 'betflag'
