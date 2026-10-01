@@ -1054,20 +1054,32 @@ def modal_header_match(header: str, outcome: str) -> bool:
 
     return False
 
-def betflag_quotes_from_modal(html_text: str):
+def median_value(values):
+    values=sorted(float(x) for x in values if x is not None)
+    if not values:
+        return None
+    n=len(values)
+    mid=n//2
+    if n%2:
+        return values[mid]
+    return (values[mid-1]+values[mid])/2
+
+def market_quotes_from_modal(html_text: str):
     soup=BeautifulSoup(html_text,'html.parser')
-    found={}
+    out={}
 
     for table in soup.select('table.odm-table'):
         headers=[
             clean(th.get_text(' ',strip=True))
             for th in table.select('thead th')
         ]
-
         if not headers:
             continue
 
         for tr in table.select('tbody tr'):
+            if 'summary-row' in (tr.get('class') or []):
+                continue
+
             tds=tr.find_all('td',recursive=False)
             if not tds:
                 continue
@@ -1078,10 +1090,9 @@ def betflag_quotes_from_modal(html_text: str):
                 provider_cell.get_text(' ',strip=True)
             ).upper()
 
-            if provider != 'BETFLAG':
+            if not provider or provider in {'OPERATORI','VAL. MAX','VAL MAX'}:
                 continue
 
-            # Colonna 0=operatore, ultima=payout.
             for idx in range(1,min(len(tds)-1,len(headers)-1)):
                 label=headers[idx]
                 raw=clean(tds[idx].get_text(' ',strip=True))
@@ -1092,16 +1103,142 @@ def betflag_quotes_from_modal(html_text: str):
                     odd=float(m.group(1).replace(',','.'))
                 except Exception:
                     continue
-                if 1.01 < odd <= 30:
-                    found[label]=round(odd,3)
+                if not (1.01 < odd <= 30):
+                    continue
 
-    return found
+                bucket=out.setdefault(label,{'all':[],'providers':{},'betflag':None})
+                bucket['all'].append(odd)
+                bucket['providers'][provider]=odd
+                if provider=='BETFLAG':
+                    bucket['betflag']=odd
+
+    return out
+
+def stat_rate(block, key):
+    try:
+        matches=int((block or {}).get('matches') or 0)
+        if matches<3:
+            return None
+        if key.endswith('_rate'):
+            return float((block or {}).get(key))
+        count=float((block or {}).get(key) or 0)
+        return count/matches
+    except Exception:
+        return None
+
+def stats_support_for_record(record: dict) -> float:
+    profile=record.get('_stats')
+    if not isinstance(profile,dict):
+        return 0.0
+
+    home=profile.get('home_venue') or profile.get('home') or {}
+    away=profile.get('away_venue') or profile.get('away') or {}
+
+    market=str(record.get('market_name') or '')
+    outcome=str(record.get('selection_column') or '')
+
+    hw=stat_rate(home,'wins')
+    hd=stat_rate(home,'draws')
+    hl=stat_rate(home,'losses')
+    aw=stat_rate(away,'wins')
+    ad=stat_rate(away,'draws')
+    al=stat_rate(away,'losses')
+
+    ho15=stat_rate(home,'over15_rate')
+    ao15=stat_rate(away,'over15_rate')
+    ho25=stat_rate(home,'over25_rate')
+    ao25=stat_rate(away,'over25_rate')
+    hbtts=stat_rate(home,'btts_rate')
+    abtts=stat_rate(away,'btts_rate')
+
+    def avg(a,b):
+        vals=[x for x in (a,b) if x is not None]
+        return sum(vals)/len(vals) if vals else None
+
+    score=0.0
+
+    if market=='1X2':
+        if outcome=='1' and hw is not None and al is not None:
+            score=(hw+al)/2
+        elif outcome=='2' and aw is not None and hl is not None:
+            score=(aw+hl)/2
+
+    elif market=='Doppia chance':
+        if outcome=='1X' and hl is not None and aw is not None:
+            score=1-((hl+aw)/2)
+        elif outcome=='X2' and hw is not None and al is not None:
+            score=1-((hw+al)/2)
+        elif outcome=='12' and hd is not None and ad is not None:
+            score=1-((hd+ad)/2)
+
+    elif market=='Over/Under':
+        if outcome=='Over 1.5':
+            score=avg(ho15,ao15) or 0.0
+        elif outcome=='Over 2.5':
+            score=avg(ho25,ao25) or 0.0
+        elif outcome=='Under 2.5':
+            over=avg(ho25,ao25)
+            score=(1-over) if over is not None else 0.0
+
+    elif market=='Gol/No Gol':
+        if outcome=='GG':
+            score=avg(hbtts,abtts) or 0.0
+        elif outcome=='NG':
+            btts=avg(hbtts,abtts)
+            score=(1-btts) if btts is not None else 0.0
+
+    return round(max(0.0,min(1.0,score)),3)
+
+def quality_tier_for_record(record: dict) -> int:
+    support=int(record.get('_externalSupportCount') or 0)
+    oppose=int(record.get('_externalOpposeCount') or 0)
+    stats=float(record.get('_statsSupport') or 0)
+    providers=int(record.get('_providerCount') or 0)
+    spread=float(record.get('_marketSpreadPct') or 9)
+    deviation=float(record.get('_betflagDeviationPct') or 9)
+    median_odd=float(record.get('_marketMedianOdd') or 99)
+
+    # Se il mercato è poco coperto o Betflag è un forte outlier,
+    # la selezione non è abbastanza stabile per la board.
+    if providers < 5:
+        return 0
+    if spread > .24 or deviation > .12:
+        return 0
+    if oppose > support and oppose > 0:
+        return 0
+
+    # A: consenso esterno forte.
+    if support >= 2 and oppose == 0:
+        return 4
+
+    # B: una conferma esterna + statistiche reali coerenti.
+    if support >= 1 and oppose == 0 and stats >= .58:
+        return 4
+
+    # C: statistiche molto forti + mercato largo e stabile.
+    if stats >= .72 and providers >= 6 and spread <= .18:
+        return 3
+
+    # D: una conferma esterna senza opposizioni, con mercato stabile.
+    if support >= 1 and oppose == 0 and providers >= 6 and spread <= .18:
+        return 3
+
+    # E: solo mercato, ma deve essere molto ampio/stabile e la probabilità
+    # implicita deve essere elevata. È il fallback meno preferito.
+    if (
+        support==0 and oppose==0 and
+        providers>=8 and
+        spread<=.12 and
+        deviation<=.07 and
+        median_odd<=1.42
+    ):
+        return 2
+
+    return 0
 
 def verify_records_on_odd24_betflag(records, day: str, now: datetime):
     cutoff=now+timedelta(minutes=45)
 
-    # Raggruppa per modal mercato: una richiesta verifica tutte le uscite
-    # di quel mercato per quella partita.
     groups={}
     for record in records:
         modal=record.get('_modalUrl')
@@ -1119,12 +1256,11 @@ def verify_records_on_odd24_betflag(records, day: str, now: datetime):
         if record.get('selection_column') in ('X','Under 1.5'):
             continue
 
-        # Il valore massimo visibile aiuta solo a ridurre richieste inutili.
-        # Betflag può avere quota inferiore; teniamo quindi un margine ampio.
         try:
             overview_odd=float(record.get('odd') or 0)
         except Exception:
             continue
+
         if not (1.03 <= overview_odd <= 2.30):
             continue
 
@@ -1143,7 +1279,7 @@ def verify_records_on_odd24_betflag(records, day: str, now: datetime):
         url=modal if str(modal).startswith('http') else 'https://odd24.io'+str(modal)
         response=requests.get(url,timeout=16,headers=headers)
         response.raise_for_status()
-        return modal,betflag_quotes_from_modal(response.text)
+        return modal,market_quotes_from_modal(response.text)
 
     modal_quotes={}
     with ThreadPoolExecutor(max_workers=12) as pool:
@@ -1166,27 +1302,45 @@ def verify_records_on_odd24_betflag(records, day: str, now: datetime):
 
         for record in rows:
             outcome=str(record.get('selection_column') or '')
-            matched_odd=None
+            matched=None
 
-            for header,odd in quotes.items():
+            for header,bucket in quotes.items():
                 if modal_header_match(header,outcome):
-                    matched_odd=odd
+                    matched=bucket
                     break
 
-            if matched_odd is None:
+            if not matched:
                 continue
 
+            betflag=matched.get('betflag')
+            all_odds=[float(x) for x in matched.get('all') or [] if float(x)>1]
+            if betflag is None or len(all_odds)<3:
+                continue
+
+            median=median_value(all_odds)
+            if median is None or median<=1:
+                continue
+
+            minimum=min(all_odds)
+            maximum=max(all_odds)
+            spread=(maximum-minimum)/median
+            deviation=abs(float(betflag)-median)/median
+
             item=dict(record)
-            item['odd']=round(float(matched_odd),3)
+            item['odd']=round(float(betflag),3)
             item['_betflagPlayable']=True
             item['_bookmaker']='Betflag'
-            item['_betflagOdd']=round(float(matched_odd),3)
+            item['_betflagOdd']=round(float(betflag),3)
             item['_betflagCheckedAt']=checked_at
-            item['_playabilitySource']='odd24-modal-betflag-v1'
+            item['_playabilitySource']='odd24-modal-betflag-v2'
+            item['_providerCount']=len(matched.get('providers') or {})
+            item['_marketMedianOdd']=round(median,3)
+            item['_marketSpreadPct']=round(spread,4)
+            item['_betflagDeviationPct']=round(deviation,4)
             verified.append(item)
 
     print(
-        f'BETFLAG MODAL {day}: {len(verified)} selezioni verificate '
+        f'BETFLAG MODAL V2 {day}: {len(verified)} selezioni verificate '
         f'su {len(groups)} mercati controllati'
     )
 
@@ -1410,6 +1564,8 @@ def enrich_records_with_multi_source_v6(records, pages):
             r['_externalCovered']=0
             r['_externalNet']=0.0
             r['_externalTier']=0
+            r['_statsSupport']=stats_support_for_record(r)
+            r['_qualityTier']=quality_tier_for_record(r)
         return records
 
     cache={}
@@ -1478,6 +1634,8 @@ def enrich_records_with_multi_source_v6(records, pages):
         r['_externalNet']=round(net,3)
         r['_externalTier']=tier
         r['_externalSupportSources']=support_sources
+        r['_statsSupport']=stats_support_for_record(r)
+        r['_qualityTier']=quality_tier_for_record(r)
 
     return records
 
@@ -1497,7 +1655,10 @@ def load_existing_board(day: str):
             len(roads)==5 and
             all(len(r.get('selections',[]))==2 for r in roads) and
             version>=5 and
-            board.get('playability_source')=='odd24-modal-betflag-v1' and
+            board.get('playability_source') in {
+                'odd24-modal-betflag-v1',
+                'odd24-modal-betflag-v2'
+            } and
             all(
                 all(
                     bool(sel.get('_betflagPlayable')) and
@@ -1538,12 +1699,20 @@ def board_record_score(record: dict) -> float:
     covered=int(record.get('_externalCovered') or 0)
     net=float(record.get('_externalNet') or 0)
     tier=int(record.get('_externalTier') or 0)
+    quality=int(record.get('_qualityTier') or 0)
+    stats_support=float(record.get('_statsSupport') or 0)
+    providers=int(record.get('_providerCount') or 0)
+    spread=float(record.get('_marketSpreadPct') or 9)
 
     base=(
-        conf*50 +
-        (1/odd)*34 +
+        conf*42 +
+        (1/odd)*26 +
         board_market_bonus(record) -
-        max(0,odd-1.35)*11
+        max(0,odd-1.35)*11 +
+        quality*16 +
+        stats_support*12 +
+        min(providers,10)*.75 -
+        max(0,spread-.08)*35
     )
 
     consensus=(
@@ -1571,7 +1740,7 @@ def build_canonical_board(records, day: str, now: datetime):
         if bool(r.get('_betflagPlayable')) and
         r.get('_bookmaker')=='Betflag'
     ]
-    playability_source='odd24-modal-betflag-v1'
+    playability_source='odd24-modal-betflag-v2'
 
     print(
         f'PLAYABLE {day}: {len(verified_records)} selezioni '
@@ -1597,10 +1766,12 @@ def build_canonical_board(records, day: str, now: datetime):
         support=int(r.get('_externalSupportCount') or 0)
         oppose=int(r.get('_externalOpposeCount') or 0)
         covered=int(r.get('_externalCovered') or 0)
+        quality=int(r.get('_qualityTier') or 0)
 
-        # Se le fonti trovate sono nettamente contrarie, la selezione
-        # non entra nella board. Una mancata copertura invece non viene
-        # confusa con un parere negativo.
+        # V7: niente più semplice "quota bassa = buona".
+        # Deve superare almeno un filtro di consenso/statistiche/mercato.
+        if quality<=0:
+            continue
         if covered>0 and oppose>support:
             continue
 
@@ -1709,12 +1880,18 @@ def build_canonical_board(records, day: str, now: datetime):
                 '_bookmaker':'Betflag',
                 '_betflagOdd':r.get('_betflagOdd'),
                 '_betflagCheckedAt':r.get('_betflagCheckedAt'),
-                '_playabilitySource':'odd24-modal-betflag-v1',
+                '_playabilitySource':'odd24-modal-betflag-v2',
                 '_externalSupportCount':int(r.get('_externalSupportCount') or 0),
                 '_externalOpposeCount':int(r.get('_externalOpposeCount') or 0),
                 '_externalCovered':int(r.get('_externalCovered') or 0),
                 '_externalNet':float(r.get('_externalNet') or 0),
                 '_externalTier':int(r.get('_externalTier') or 0),
+                '_statsSupport':float(r.get('_statsSupport') or 0),
+                '_qualityTier':int(r.get('_qualityTier') or 0),
+                '_providerCount':int(r.get('_providerCount') or 0),
+                '_marketMedianOdd':r.get('_marketMedianOdd'),
+                '_marketSpreadPct':r.get('_marketSpreadPct'),
+                '_betflagDeviationPct':r.get('_betflagDeviationPct'),
             })
         roads.append({
             'road':road,
@@ -1723,14 +1900,14 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':6,
+        'version':7,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
         'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
-        'selection_engine':'multi-source-consensus-v6',
-        'quality_policy':'prefer_multi_source_no_net_contradiction',
+        'selection_engine':'quality-gate-multi-source-v7',
+        'quality_policy':'hard_gate_sources_stats_market_consensus',
         'roads':roads,
     }
 
