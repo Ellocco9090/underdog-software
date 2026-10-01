@@ -1768,9 +1768,9 @@ def build_canonical_board(records, day: str, now: datetime):
         covered=int(r.get('_externalCovered') or 0)
         quality=int(r.get('_qualityTier') or 0)
 
-        # V7: niente più semplice "quota bassa = buona".
-        # Deve superare almeno un filtro di consenso/statistiche/mercato.
-        if quality<=0:
+        # V8: niente fallback debole. La selezione entra solo se supera
+        # un Quality Tier almeno 3 (consenso/statistiche/mercato stabili).
+        if quality<3:
             continue
         if covered>0 and oppose>support:
             continue
@@ -1815,7 +1815,9 @@ def build_canonical_board(records, day: str, now: datetime):
             if a['gid'] == b['gid']:
                 continue
             total = float(a['record']['odd']) * float(b['record']['odd'])
-            if total < 1.50 or total > 1.60:
+            # Quota strada richiesta: 1.50 reale arrotondata a due decimali.
+            # Non allarghiamo il range per riempire a forza le 5 strade.
+            if round(total,2) != 1.50:
                 continue
             same_league=(
                 a['record'].get('country') == b['record'].get('country') and
@@ -1828,13 +1830,20 @@ def build_canonical_board(records, day: str, now: datetime):
                 int(b['record'].get('_externalSupportCount') or 0)>0
             )
 
+            quality_a=int(a['record'].get('_qualityTier') or 0)
+            quality_b=int(b['record'].get('_qualityTier') or 0)
+            support_a=int(a['record'].get('_externalSupportCount') or 0)
+            support_b=int(b['record'].get('_externalSupportCount') or 0)
+
             score=(
                 a['score']+
                 b['score']-
-                abs(total-1.50)*45-
-                (1.5 if same_league else 0)+
-                min(tier_a,tier_b)*2.0+
-                (4.0 if both_supported else 0.0)
+                abs(total-1.50)*120-
+                (2.0 if same_league else 0)+
+                min(quality_a,quality_b)*8.0+
+                min(tier_a,tier_b)*3.0+
+                min(support_a,support_b)*4.0+
+                (6.0 if both_supported else 0.0)
             )
 
             pairs.append({'a':a,'b':b,'total':total,'score':score})
@@ -1900,14 +1909,14 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':7,
+        'version':8,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
         'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
-        'selection_engine':'quality-gate-multi-source-v7',
-        'quality_policy':'hard_gate_sources_stats_market_consensus',
+        'selection_engine':'strict-quality-exact-150-v8',
+        'quality_policy':'tier3plus_exact_150_no_forced_fill',
         'roads':roads,
     }
 
@@ -1925,6 +1934,20 @@ def build_day(day: str, make_latest: bool):
     now=datetime.now(ROME)
     board=load_existing_board(day)
 
+    # Le board già pubblicate di OGGI restano intoccabili.
+    # Una board FUTURA costruita col vecchio motore viene rigenerata UNA SOLA VOLTA
+    # col V8; poi resta congelata come tutte le altre.
+    if (
+        board is not None and
+        day > now.date().isoformat() and
+        int(board.get('version') or 0) < 8
+    ):
+        print(
+            f'REBUILD FUTURE {day}: v{board.get("version")} -> V8',
+            file=sys.stderr
+        )
+        board=None
+
     if board is not None:
         print(
             f'BOARD FREEZE {day}: v{board.get("version")} '
@@ -1938,8 +1961,8 @@ def build_day(day: str, make_latest: bool):
 
         if board is None:
             print(
-                f'WARN {day}: non ci sono 10 selezioni Betflag '
-                'verificate e compatibili per costruire 5 strade',
+                f'WARN {day}: non ci sono 10 selezioni Tier>=3, Betflag '
+                'verificate e combinabili esattamente a quota 1.50',
                 file=sys.stderr
             )
 
