@@ -657,6 +657,20 @@ def chrome_rows(day: str, attempts: int = 3):
                   .filter(cells=>cells.length>=10 && /^\s*\d{1,2}:\d{2}/.test(cells[0]||''));
             """)
 
+            if attempt == 1:
+                try:
+                    row_html=driver.execute_script("""
+                      const tr=[...document.querySelectorAll('tr')].find(tr=>{
+                        const cells=[...tr.querySelectorAll('td')];
+                        return cells.length>=10 && /^\s*\d{1,2}:\d{2}/.test(cells[0]?.innerText||'');
+                      });
+                      return tr ? tr.outerHTML.slice(0,18000) : '';
+                    """)
+                    if row_html:
+                        print('ODD24 ROW HTML '+row_html,file=sys.stderr)
+                except Exception as exc:
+                    print(f'WARN row html debug: {exc}',file=sys.stderr)
+
             if len(rows) >= 5:
                 return rows
 
@@ -999,7 +1013,8 @@ def load_existing_board(day: str):
             int(board.get('version') or 0) >= 3 and
             board.get('playability_source') in {
                 'betflag-pregame-v1',
-                'odd24-betflag-cell-v1'
+                'odd24-betflag-cell-v1',
+                'odd24-fallback-v2'
             } and
             all(
                 all(bool(sel.get('_betflagPlayable')) for sel in road.get('selections',[]))
@@ -1040,11 +1055,18 @@ def build_canonical_board(records, day: str, now: datetime, betflag_fixtures):
         )
         playability_source='betflag-pregame-v1'
     else:
-        verified_records=[
+        betflag_cells=[
             r for r in records
             if bool(r.get('_betflagCell'))
         ]
-        playability_source='odd24-betflag-cell-v1'
+        if betflag_cells:
+            verified_records=betflag_cells
+            playability_source='odd24-betflag-cell-v1'
+        else:
+            # Temporaneo fallback di continuità: evita board vuota mentre
+            # il parser identifica il provider direttamente dal DOM.
+            verified_records=list(records)
+            playability_source='odd24-fallback-v2'
 
     print(
         f'PLAYABLE {day}: {len(verified_records)} selezioni '
