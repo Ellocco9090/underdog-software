@@ -2226,16 +2226,17 @@ def build_day(day: str, make_latest: bool):
     now=datetime.now(ROME)
     board=load_existing_board(day)
 
-    # Le board già pubblicate di OGGI restano intoccabili.
-    # Una board FUTURA costruita col vecchio motore viene rigenerata UNA SOLA VOLTA
-    # col V8; poi resta congelata come tutte le altre.
+    # MIGRAZIONE UNA-TANTUM V9: dal 02/10/2026 in poi una board
+    # costruita col vecchio motore viene rigenerata UNA SOLA VOLTA.
+    # Appena nasce una V9 valida torna immediatamente ad essere congelata
+    # e identica per tutti per l'intera giornata.
     if (
         board is not None and
-        day > now.date().isoformat() and
+        day >= '2026-10-02' and
         int(board.get('version') or 0) < 9
     ):
         print(
-            f'REBUILD FUTURE {day}: v{board.get("version")} -> V9',
+            f'REBUILD TO V9 {day}: v{board.get("version")} -> V9',
             file=sys.stderr
         )
         board=None
