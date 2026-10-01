@@ -1446,9 +1446,12 @@ def load_matris_high_confidence_dc_v9(records):
     session=requests.Session()
     session.headers.update(headers)
 
+    # Matris usa ?gun= per cambiare giornata nella schermata fixtures.
+    # Leggiamo una finestra ampia attorno ad oggi e poi abbiniamo per squadre,
+    # così non dipendiamo dalla giornata selezionata di default sul sito.
     seeds=[
         'https://matrisx.com/en',
-        'https://matrisx.com/en/track-record',
+        *[f'https://matrisx.com/en?gun={offset}' for offset in range(-2,8)],
     ]
 
     league_urls=set()
@@ -1461,7 +1464,7 @@ def load_matris_high_confidence_dc_v9(records):
             soup=BeautifulSoup(response.text,'html.parser')
             for a in soup.select('a[href]'):
                 href=str(a.get('href') or '')
-                if '/en/leagues/' in href:
+                if '/en/leagues/' in href or '/en/league/' in href:
                     league_urls.add(absolute_url(seed,href))
                 if '/en/match/' in href:
                     label=clean(
@@ -1513,12 +1516,6 @@ def load_matris_high_confidence_dc_v9(records):
         f'MATRIS DISCOVERY: leagues={len(league_urls)} links={len(unique_links)} '
         f'candidates={len(candidates)}'
     )
-    if unique_links:
-        print(
-            'MATRIS SAMPLE: '+
-            json.dumps(list(unique_links.items())[:12],ensure_ascii=False)[:9000]
-        )
-
     event_to_url={}
     for r in candidates:
         for url,label in unique_links.items():
@@ -2518,9 +2515,6 @@ def build_day(day: str, make_latest: bool):
             f'BOARD FREEZE {day}: v{board.get("version")} '
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
-        if day == '2026-10-02':
-            _mi=matris_fixture_index_v8()
-            print('MATRIS DIAG V8 sample='+json.dumps(_mi[:8],ensure_ascii=False))
     else:
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
