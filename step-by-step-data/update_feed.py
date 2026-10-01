@@ -2070,6 +2070,39 @@ def enrich_records_with_multi_source_v6(records, pages):
 
     return records
 
+
+def matris_fixture_index_v8():
+    try:
+        response=requests.get(
+            'https://matrisx.com/en',
+            timeout=20,
+            headers={'User-Agent':'Mozilla/5.0 StepByStep/1.0','Accept':'text/html,*/*'}
+        )
+        response.raise_for_status()
+        soup=BeautifulSoup(response.text,'html.parser')
+        items=[]
+        seen=set()
+        for a in soup.select('a[href*="/en/match/"]'):
+            href=clean(a.get('href',''))
+            if not href:
+                continue
+            if href.startswith('/'):
+                href='https://matrisx.com'+href
+            if href in seen:
+                continue
+            seen.add(href)
+            node=a
+            for _ in range(3):
+                if getattr(node,'parent',None) is not None:
+                    node=node.parent
+            context=clean(node.get_text(' ',strip=True))[:700] if node else clean(a.get_text(' ',strip=True))
+            items.append({'url':href,'context':context})
+        print(f'MATRIS INDEX V8: {len(items)} match link trovati')
+        return items
+    except Exception as exc:
+        print(f'WARN Matris index: {exc}',file=sys.stderr)
+        return []
+
 def load_existing_board(day: str):
     path=OUT_DIR / f'{day}.json'
     if not path.exists():
@@ -2475,6 +2508,9 @@ def build_day(day: str, make_latest: bool):
             f'BOARD FREEZE {day}: v{board.get("version")} '
             f'{board.get("selection_engine","legacy-v5")} · invariata'
         )
+        if day == '2026-10-02':
+            _mi=matris_fixture_index_v8()
+            print('MATRIS DIAG V8 sample='+json.dumps(_mi[:8],ensure_ascii=False))
     else:
         pages=load_multi_source_pages_v6()
         verified=verify_records_on_odd24_betflag(records,day,now)
