@@ -25,7 +25,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests selenium
+        run: pip install requests selenium beautifulsoup4
 
       - name: Build today and tomorrow feeds
         run: python step-by-step-data/update_feed.py
