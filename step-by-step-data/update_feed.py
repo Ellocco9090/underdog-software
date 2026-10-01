@@ -885,9 +885,9 @@ def build_day(day: str, make_latest: bool):
         raise RuntimeError(f'{day}: feed incompleto: {len(records)} record, {c}')
 
     now=datetime.now(ROME)
-    board=None
-    if make_latest:
-        board=load_existing_board(day) or build_canonical_board(records,day,now)
+    # Board centrale anche per DOMANI: serve quando un WIN/LOSS
+    # fa avanzare subito una strada al giorno successivo.
+    board=load_existing_board(day) or build_canonical_board(records,day,now)
 
     payload={
         'date':day,
