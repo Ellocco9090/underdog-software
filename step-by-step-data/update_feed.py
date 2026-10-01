@@ -1935,7 +1935,11 @@ def load_existing_board(day: str):
             isinstance(roads,list) and
             len(roads)==5 and
             all(len(r.get('selections',[]))==2 for r in roads) and
-            version>=5 and
+            (
+                version>=10
+                if day>='2026-10-02'
+                else version>=5
+            ) and
             board.get('playability_source') in {
                 'odd24-modal-betflag-v1',
                 'odd24-modal-betflag-v2'
@@ -2054,14 +2058,39 @@ def build_canonical_board(records, day: str, now: datetime):
         quality=int(r.get('_qualityTier') or 0)
         validated90=int(r.get('_validated90SupportCount') or 0)
 
-        # V9: una giocata entra SOLO se una fonte con storico pubblico >=90%
-        # la supporta sullo stesso mercato. Gli altri siti non possono abilitarla.
-        if validated90<1:
-            continue
-        if quality<4:
-            continue
+        # V10: le fonti con track record pubblico >=90% hanno PRIORITÀ MASSIMA.
+        # Se per una specifica partita non esiste oggi una copertura 90% pubblica,
+        # la giocata può entrare solo tramite il quality gate forte:
+        # consenso esterno reale oppure statistiche molto forti + mercato stabile.
         if covered>0 and oppose>support:
             continue
+
+        if validated90>=1:
+            if quality<4:
+                continue
+        else:
+            stats_support=float(r.get('_statsSupport') or 0)
+            providers=int(r.get('_providerCount') or 0)
+            spread=float(r.get('_marketSpreadPct') or 9)
+            deviation=float(r.get('_betflagDeviationPct') or 9)
+
+            strong_consensus=(support>=2 and oppose==0)
+            mixed_strong=(
+                support>=1 and oppose==0 and
+                stats_support>=.60 and
+                providers>=6 and
+                spread<=.18 and
+                deviation<=.10
+            )
+            stats_market=(
+                stats_support>=.72 and
+                providers>=8 and
+                spread<=.14 and
+                deviation<=.08
+            )
+
+            if quality<3 or not (strong_consensus or mixed_strong or stats_market):
+                continue
 
         future.append(r)
 
@@ -2144,16 +2173,49 @@ def build_canonical_board(records, day: str, now: datetime):
 
     chosen=[]
     used=set()
+    league_usage={}
+
+    # Primo passaggio: qualità + diversificazione.
     for p in pairs:
         if p['a']['gid'] in used or p['b']['gid'] in used:
             continue
+
+        ra=p['a']['record']
+        rb=p['b']['record']
+        ka=(str(ra.get('country','')),str(ra.get('league_name','')))
+        kb=(str(rb.get('country','')),str(rb.get('league_name','')))
+
+        # Non più di due selezioni dello stesso campionato nella board,
+        # quando il pool consente di mantenere 5 strade complete.
+        if league_usage.get(ka,0)>=2 or league_usage.get(kb,0)>=2:
+            continue
+
         chosen.append(p)
         used.add(p['a']['gid'])
         used.add(p['b']['gid'])
-        if len(chosen) == 5:
+        league_usage[ka]=league_usage.get(ka,0)+1
+        league_usage[kb]=league_usage.get(kb,0)+1
+
+        if len(chosen)==5:
             break
 
-    if len(chosen) < 5:
+    # Secondo passaggio: se la diversificazione impedisce di arrivare a 5,
+    # rilassiamo SOLO il limite campionato, mai i filtri di qualità né quota 1.50.
+    if len(chosen)<5:
+        for p in pairs:
+            if p in chosen:
+                continue
+            if p['a']['gid'] in used or p['b']['gid'] in used:
+                continue
+
+            chosen.append(p)
+            used.add(p['a']['gid'])
+            used.add(p['b']['gid'])
+
+            if len(chosen)==5:
+                break
+
+    if len(chosen)<5:
         return None
 
     roads=[]
@@ -2193,6 +2255,11 @@ def build_canonical_board(records, day: str, now: datetime):
                 '_validated90Sources':r.get('_validated90Sources') or [],
                 '_validated90Details':r.get('_validated90Details') or [],
                 '_validated90BestHistoricalRate':float(r.get('_validated90BestHistoricalRate') or 0),
+                '_approvalPath':(
+                    'validated90'
+                    if int(r.get('_validated90SupportCount') or 0)>0
+                    else 'strong-quality-gate'
+                ),
             })
         roads.append({
             'road':road,
@@ -2201,14 +2268,14 @@ def build_canonical_board(records, day: str, now: datetime):
         })
 
     return {
-        'version':9,
+        'version':10,
         'date':day,
         'generated_at':now.isoformat(),
         'locked':True,
         'playability_source':playability_source,
         'playability_checked_at':now.isoformat(),
-        'selection_engine':'validated90-exact150-v9',
-        'quality_policy':'validated90_primary_quality4_exact150',
+        'selection_engine':'priority90-qualitygate-exact150-v10',
+        'quality_policy':'validated90_priority_or_strong_qualitygate_exact150',
         'roads':roads,
     }
 
@@ -2233,10 +2300,10 @@ def build_day(day: str, make_latest: bool):
     if (
         board is not None and
         day >= '2026-10-02' and
-        int(board.get('version') or 0) < 9
+        int(board.get('version') or 0) < 10
     ):
         print(
-            f'REBUILD TO V9 {day}: v{board.get("version")} -> V9',
+            f'REBUILD TO V10 {day}: v{board.get("version")} -> V10',
             file=sys.stderr
         )
         board=None
@@ -2255,8 +2322,8 @@ def build_day(day: str, make_latest: bool):
 
         if board is None:
             print(
-                f'WARN {day}: non ci sono 10 selezioni con fonte >=90% verificata, '
-                'Quality 4, Betflag e combinazione esatta quota 1.50',
+                f'WARN {day}: non ci sono 10 selezioni che superano '
+                'quality gate forte + Betflag + combinazione esatta quota 1.50',
                 file=sys.stderr
             )
 
