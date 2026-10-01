@@ -41,31 +41,46 @@ MULTI_SOURCE_BOARD_V6 = [
         'id':'predictz',
         'weight':1.00,
         'kind':'predictz',
-        'url':'https://r.jina.ai/http://www.predictz.com/predictions/',
+        'urls':[
+            'https://www.predictz.com/predictions/',
+            'https://r.jina.ai/http://www.predictz.com/predictions/',
+        ],
     },
     {
         'id':'windrawwin',
         'weight':0.96,
         'kind':'windrawwin',
-        'url':'https://r.jina.ai/http://www.windrawwin.com/',
+        'urls':[
+            'https://www.windrawwin.com/',
+            'https://r.jina.ai/http://www.windrawwin.com/',
+        ],
     },
     {
         'id':'forebet',
         'weight':1.02,
         'kind':'forebet',
-        'url':'https://r.jina.ai/http://www.forebet.com/en',
+        'urls':[
+            'https://www.forebet.com/en',
+            'https://r.jina.ai/http://www.forebet.com/en',
+        ],
     },
     {
         'id':'forebetdc',
         'weight':1.04,
         'kind':'forebetdc',
-        'url':'https://r.jina.ai/http://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
+        'urls':[
+            'https://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
+            'https://r.jina.ai/http://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
+        ],
     },
     {
         'id':'vitibet',
         'weight':0.98,
         'kind':'vitibet',
-        'url':'https://r.jina.ai/http://www.vitibet.com/index.php?clanek=quicktips&lang=en&sekce=fotbal',
+        'urls':[
+            'https://www.vitibet.com/index.php?clanek=quicktips&lang=en&sekce=fotbal',
+            'https://r.jina.ai/http://www.vitibet.com/index.php?clanek=quicktips&lang=en&sekce=fotbal',
+        ],
     },
 ]
 
@@ -1805,17 +1820,23 @@ def load_multi_source_pages_v6():
     }
 
     def one(source):
-        response=requests.get(source['url'],headers=headers,timeout=18)
-        response.raise_for_status()
-        text=source_plain(response.text)
-        if len(text)<300:
-            raise RuntimeError('pagina troppo corta')
-        return {
-            'id':source['id'],
-            'kind':source['kind'],
-            'weight':float(source['weight']),
-            'text':text,
-        }
+        errors=[]
+        for url in source.get('urls') or []:
+            try:
+                response=requests.get(url,headers=headers,timeout=18)
+                response.raise_for_status()
+                page_text=source_plain(response.text)
+                if len(page_text)<300:
+                    raise RuntimeError('pagina troppo corta')
+                return {
+                    'id':source['id'],
+                    'kind':source['kind'],
+                    'weight':float(source['weight']),
+                    'text':page_text,
+                }
+            except Exception as exc:
+                errors.append(str(exc))
+        raise RuntimeError(' | '.join(errors) or 'nessun URL')
 
     pages=[]
     with ThreadPoolExecutor(max_workers=5) as pool:
