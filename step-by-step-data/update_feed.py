@@ -38,52 +38,42 @@ BETFLAG_HEADERS = {
 
 MULTI_SOURCE_BOARD_V6 = [
     {
+        'id':'matris',
+        'weight':1.28,
+        'kind':'matris',
+        'url':'https://r.jina.ai/http://matrisx.com/en',
+    },
+    {
+        'id':'footballprediction',
+        'weight':1.20,
+        'kind':'footballprediction',
+        'url':'https://r.jina.ai/http://www.footballprediction.ai/previews',
+    },
+    {
         'id':'predictz',
-        'weight':1.00,
+        'weight':0.72,
         'kind':'predictz',
-        'urls':[
-            'https://www.predictz.com/predictions/',
-            'https://r.jina.ai/http://www.predictz.com/predictions/',
-        ],
+        'url':'https://r.jina.ai/http://www.predictz.com/predictions/',
     },
     {
         'id':'windrawwin',
-        'weight':0.96,
+        'weight':0.68,
         'kind':'windrawwin',
-        'urls':[
-            'https://www.windrawwin.com/',
-            'https://r.jina.ai/http://www.windrawwin.com/',
-        ],
+        'url':'https://r.jina.ai/http://www.windrawwin.com/',
     },
     {
         'id':'forebet',
-        'weight':1.02,
+        'weight':0.72,
         'kind':'forebet',
-        'urls':[
-            'https://www.forebet.com/en',
-            'https://r.jina.ai/http://www.forebet.com/en',
-        ],
+        'url':'https://r.jina.ai/http://www.forebet.com/en',
     },
     {
         'id':'forebetdc',
-        'weight':1.04,
+        'weight':0.76,
         'kind':'forebetdc',
-        'urls':[
-            'https://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
-            'https://r.jina.ai/http://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
-        ],
-    },
-    {
-        'id':'vitibet',
-        'weight':0.98,
-        'kind':'vitibet',
-        'urls':[
-            'https://www.vitibet.com/index.php?clanek=quicktips&lang=en&sekce=fotbal',
-            'https://r.jina.ai/http://www.vitibet.com/index.php?clanek=quicktips&lang=en&sekce=fotbal',
-        ],
+        'url':'https://r.jina.ai/http://www.forebet.com/en/football-tips-and-predictions-for-today/double-chance-predictions',
     },
 ]
-
 def clean(s: str) -> str:
     return re.sub(r'\s+', ' ', str(s or '').replace('\xa0',' ')).strip()
 
@@ -1214,6 +1204,7 @@ def quality_tier_for_record(record: dict) -> int:
     spread=float(record.get('_marketSpreadPct') or 9)
     deviation=float(record.get('_betflagDeviationPct') or 9)
     median_odd=float(record.get('_marketMedianOdd') or 99)
+    high_track=int(record.get('_highTrackSupportCount') or 0)
 
     # Se il mercato è poco coperto o Betflag è un forte outlier,
     # la selezione non è abbastanza stabile per la board.
@@ -1228,6 +1219,11 @@ def quality_tier_for_record(record: dict) -> int:
     # sullo STESSO tipo di mercato + mercato bookmaker stabile.
     if validated90>=1 and providers>=5 and spread<=.18 and deviation<=.10:
         return 4
+
+    # A0: almeno una conferma da una fonte con track record
+    # pubblico >=90% sullo specifico mercato.
+    if high_track >= 1 and oppose == 0:
+        return 5
 
     # A: consenso esterno forte.
     if support >= 2 and oppose == 0:
@@ -2261,6 +2257,33 @@ def source_signals(kind: str, chunk: str):
     s=source_plain(chunk)
     out=set()
 
+    # Matris: usa come segnale forte SOLO doppie chance >=85%.
+    # Il loro track record pubblico per questa fascia è ~90.7%.
+    if kind=='matris':
+        patterns=[
+            r'highest double chance value is\s+(\d+(?:\.\d+)?)%\s*\((1x|12|x2)',
+            r'(1x|12|x2)[^%]{0,45}(\d+(?:\.\d+)?)%'
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat,s,re.I):
+                if pat.startswith('highest'):
+                    pct=float(m.group(1)); pick=m.group(2).upper()
+                else:
+                    pick=m.group(1).upper(); pct=float(m.group(2))
+                if pct>=85:
+                    out.add({'1X':'DC1X','X2':'DCX2','12':'DC12'}[pick])
+        return out
+
+    # Football Prediction AI: consideriamo forte solo Over 1.5,
+    # il mercato con track record pubblico sopra il 90%.
+    if kind=='footballprediction':
+        if (
+            'over 1.5' in s and
+            re.search(r'\b(prediction|pick|ai s choice|best bet|over 1.5 goals)\b',s)
+        ):
+            out.add('O15')
+        return out
+
     if re.search(r'\b(home win|home victory|prediction home|pronostico vittoria casa)\b',s):
         out.add('H')
     if re.search(r'\b(away win|away victory|prediction away|pronostico vittoria trasferta)\b',s):
@@ -2411,6 +2434,7 @@ def enrich_records_with_multi_source_v6(records, pages):
             r['_externalCovered']=0
             r['_externalNet']=0.0
             r['_externalTier']=0
+            r['_highTrackSupportCount']=0
             r['_statsSupport']=stats_support_for_record(r)
             r['_qualityTier']=quality_tier_for_record(r)
         return records
@@ -2481,6 +2505,10 @@ def enrich_records_with_multi_source_v6(records, pages):
         r['_externalNet']=round(net,3)
         r['_externalTier']=tier
         r['_externalSupportSources']=support_sources
+        r['_highTrackSupportCount']=sum(
+            1 for x in support_sources
+            if x in {'matris','footballprediction'}
+        )
         r['_statsSupport']=stats_support_for_record(r)
         r['_qualityTier']=quality_tier_for_record(r)
 
@@ -2579,6 +2607,7 @@ def board_record_score(record: dict) -> float:
     )
 
     tier_bonus={
+        5:24.0,
         4:18.0,
         3:12.0,
         2:6.5,
@@ -2821,6 +2850,7 @@ def build_canonical_board(records, day: str, now: datetime):
                 '_externalCovered':int(r.get('_externalCovered') or 0),
                 '_externalNet':float(r.get('_externalNet') or 0),
                 '_externalTier':int(r.get('_externalTier') or 0),
+                '_highTrackSupportCount':int(r.get('_highTrackSupportCount') or 0),
                 '_statsSupport':float(r.get('_statsSupport') or 0),
                 '_qualityTier':int(r.get('_qualityTier') or 0),
                 '_providerCount':int(r.get('_providerCount') or 0),
